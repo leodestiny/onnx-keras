@@ -2,6 +2,7 @@ from keras.layers import *
 from onnx.helper import (make_graph, make_model, make_node, make_tensor, make_tensor_value_info, make_opsetid)
 from onnx.mapping import NP_TYPE_TO_TENSOR_TYPE
 from onnx.checker import check_model
+import keras.backend as K
 
 from utils import STR_TO_ONNX_TYPE, convert_shape, rename_operator
 
