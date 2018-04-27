@@ -1,8 +1,8 @@
-from keras.layers import *
-from onnx.helper import (make_graph, make_model, make_node, make_tensor, make_tensor_value_info, make_opsetid)
-from onnx.mapping import NP_TYPE_TO_TENSOR_TYPE
-from onnx.checker import check_model
 import keras.backend as K
+from keras.layers import *
+from onnx.checker import check_model
+from onnx.helper import (make_graph, make_model, make_node, make_tensor, make_tensor_value_info)
+from onnx.mapping import NP_TYPE_TO_TENSOR_TYPE
 
 from utils import STR_TO_ONNX_TYPE, convert_shape, rename_operator
 
@@ -49,7 +49,7 @@ class KerasFrontend(object):
             GlobalMaxPooling2D: cls.create_global_max_pooling2D,
             GlobalAveragePooling1D: cls.create_global_average_pooling1D,
             GlobalAveragePooling2D: cls.create_global_average_pooling2D,
-            Add:cls.create_add,
+            Add: cls.create_add,
             Subtract: cls.create_sub,
             Multiply: cls.create_mul,
             Maximum: cls.create_max,
@@ -61,7 +61,10 @@ class KerasFrontend(object):
             Dropout: cls.create_dropout,
             Flatten: cls.create_flatten,
             Reshape: cls.create_reshape,
-            BatchNormalization: cls.create_batch_normalization
+            BatchNormalization: cls.create_batch_normalization,
+            LSTM:cls.create_LSTM,
+            SimpleRNN:cls.create_RNN,
+            GRU:cls.create_GRU
         }
         activation_to_handler = {
             "softmax": cls.create_softmax,
@@ -76,11 +79,12 @@ class KerasFrontend(object):
 
         if layer.__class__ in class_to_handler:
             return class_to_handler[layer.__class__]
-        elif layer.__class__ == Activation :
+        elif layer.__class__ == Activation:
             if layer.get_config()['activation'] in activation_to_handler:
                 return activation_to_handler[layer.get_config()['activation']]
             else:
-                raise NotImplementedError("This activation %s is not supported in this version" % (layer.get_config()['activation']))
+                raise NotImplementedError(
+                    "This activation %s is not supported in this version" % (layer.get_config()['activation']))
         else:
             raise NotImplementedError("This layer %s is not supported in this version" % (layer.__class__))
 
@@ -90,7 +94,6 @@ class KerasFrontend(object):
                                   model_name="keras-model"):
 
         # TODO save domain, model_version,doc_string
-
 
         model = make_model(cls.keras_graph_to_onnx_graph(model),
                            model_version=1,
@@ -123,7 +126,7 @@ class KerasFrontend(object):
         # save all weights into initializer
         initializer = []
 
-        for i,layer in enumerate(model.layers):
+        for i, layer in enumerate(model.layers):
             print(i)
             # the InputLayer only contain input data of model
             if isinstance(layer, InputLayer):
@@ -186,7 +189,6 @@ class KerasFrontend(object):
         else:
             raise NotImplementedError("ONNX need both center and scale must be True")
 
-
         # onnx outpus
         # notate onnx has other opitional output, but there is only one output in keras
         Y_name = layer.output.name
@@ -198,7 +200,7 @@ class KerasFrontend(object):
                          name=layer.name,
                          epsilon=epsilon,
                          momentum=momentum,
-                         consumed_inputs=[0,0,0,1,1],
+                         consumed_inputs=[0, 0, 0, 1, 1],
                          spatial=spatial)
         node_list.append(node)
 
@@ -210,37 +212,87 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
 
+        config = layer.get_config()
+
         # onnx attribute
-        activation_alpha = None
-        activation_bata = None
+
+        # no alpha and beta in Keras activation function
+        activation_alpha = [0.0, 0.0, 0.0]
+        activation_beta = [0.0, 0.0, 0.0]
+
         # the activation function order is f, g, h in onnx
-        # coresponding is recurrent_activation, activation, activation
-        activations = None
+        # coresponding is recurrent_activation, activation, activation in keras
+        activations = [config['recurrent_activation'], config['activation'], config['activation']]
+
+        # no clip in Keras
         clip = None
-        direction = None
-        hidden_size = None
-        output_sequence = None
+
+        if config['go_backwards']:
+            direction = "reverse"
+        else:
+            direction = "forward"
+
+        hidden_size = config['units']
+
+        output_sequence = 0
+        if config['return_sequences']:
+            output_sequence = 1
 
         # onnx input
-        # the W,R,B matrix order is [i o f c] in onnx
         # however W,R,B matrix order is [i f c o] in keras
-        X = None
-        W = None
-        R = None
-        #TODO use_bias is true or false
-        B = None
+        # the W,R,B matrix order is [i o f c] in onnx
+        symbolic_weights = layer.weights
+        weights_values = K.batch_get_value(symbolic_weights)
+
+        W_name = symbolic_weights[0].name
+        W_weight = weights_values[0]
+        W_weight = np.concatenate((W_weight[:,:hidden_size],W_weight[:,3*hidden_size:],W_weight[:,hidden_size:3*hidden_size]),axis=1)
+        graph_input_list.append(cls.make_symbolic_weights(W_name, W_weight))
+        weight_list.append(cls.make_weights(W_name, W_weight))
+
+        R_name = symbolic_weights[1].name
+        R_weight = weights_values[0]
+        R_weight = np.concatenate((R_weight[:,:hidden_size],R_weight[:,3*hidden_size:],R_weight[:,hidden_size:3*hidden_size]),axis=1)
+        graph_input_list.append(cls.make_symbolic_weights(R_name, R_weight))
+        weight_list.append(cls.make_weights(R_name, R_weight))
+
+        X = layer.input.name
+        inputs = [X, W_name, R_name]
+
+        if config['use_bias']:
+            B_name = symbolic_weights[2].name
+            B_weight = weights_values[2]
+            B_weight = np.concatenate((B_weight[:hidden_size],B_weight[3*hidden_size:],B_weight[hidden_size:3*hidden_size]),axis=0)
+            graph_input_list.append(cls.make_symbolic_weights(B_name, B_weight))
+            weight_list.append(cls.make_weights(B_name, B_weight))
+
+            inputs.append(B_name)
+
+        # these inputs are not used
         sequence_lens = None
         initial_h = None
         inital_c = None
-        # P is not used
         P = None
 
         # onnx output
-
+        # Y represent all intermediate value
+        # Y should used when return_sequences is true
+        # T_h represent last output value of hidden
         # set by return_sequence
-        Y = None
-        Y_h = None
-        Y_c = None
+
+        Y = layer.output.name
+        outputs = [Y]
+
+        node_list.append(make_node("LSTM",
+                                   inputs=inputs,
+                                   outputs=outputs,
+                                   name=layer.name,
+                                   activations=activations,
+                                   activation_alpha=activation_alpha,
+                                   activation_beta=activation_beta,
+                                   direction=direction,
+                                   hidden_size=hidden_size,
+                                   output_sequence=output_sequence))
 
         return graph_input_list, weight_list, node_list
 
@@ -250,26 +302,92 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
 
+        config = layer.get_config()
+
         # onnx attribute
-        activation_alpha = None
-        activation_bata = None
-        activations = None
+
+        # no alpha and beta in Keras activation function
+        activation_alpha = [0.0, 0.0, 0.0]
+        activation_beta = [0.0, 0.0, 0.0]
+
+        # the activation function order is f, g, h in onnx
+        # coresponding is recurrent_activation, activation, activation in keras
+        activations = [config['recurrent_activation'], config['activation'], config['activation']]
+
+        # no clip in Keras
         clip = None
-        direction = None
-        hidden_size = None
-        output_sequence = None
+
+        if config['go_backwards']:
+            direction = "reverse"
+        else:
+            direction = "forward"
+
+        hidden_size = config['units']
+
+        output_sequence = 0
+        if config['return_sequences']:
+            output_sequence = 1
 
         # onnx input
-        X = None
-        W = None
-        R = None
-        B = None
+        # however W,R,B matrix order is [i f c o] in keras
+        # the W,R,B matrix order is [i o f c] in onnx
+        symbolic_weights = layer.weights
+        weights_values = K.batch_get_value(symbolic_weights)
+
+        W_name = symbolic_weights[0].name
+        W_weight = weights_values[0]
+        W_weight = np.concatenate(
+            (W_weight[:, :hidden_size], W_weight[:, 3 * hidden_size:], W_weight[:, hidden_size:3 * hidden_size]),
+            axis=1)
+        graph_input_list.append(cls.make_symbolic_weights(W_name, W_weight))
+        weight_list.append(cls.make_weights(W_name, W_weight))
+
+        R_name = symbolic_weights[1].name
+        R_weight = weights_values[0]
+        R_weight = np.concatenate(
+            (R_weight[:, :hidden_size], R_weight[:, 3 * hidden_size:], R_weight[:, hidden_size:3 * hidden_size]),
+            axis=1)
+        graph_input_list.append(cls.make_symbolic_weights(R_name, R_weight))
+        weight_list.append(cls.make_weights(R_name, R_weight))
+
+        X = layer.input.name
+        inputs = [X, W_name, R_name]
+
+        if config['use_bias']:
+            B_name = symbolic_weights[2].name
+            B_weight = weights_values[2]
+            B_weight = np.concatenate(
+                (B_weight[:hidden_size], B_weight[3 * hidden_size:], B_weight[hidden_size:3 * hidden_size]), axis=0)
+            graph_input_list.append(cls.make_symbolic_weights(B_name, B_weight))
+            weight_list.append(cls.make_weights(B_name, B_weight))
+
+            inputs.append(B_name)
+
+        # these inputs are not used
         sequence_lens = None
         initial_h = None
+        inital_c = None
+        P = None
 
         # onnx output
-        Y = None
-        Y_h = None
+        # Y represent all intermediate value
+        # Y should used when return_sequences is true
+        # T_h represent last output value of hidden
+        # set by return_sequence
+
+        Y = layer.output.name
+        outputs = [Y]
+
+        node_list.append(make_node("GRU",
+                                   inputs=inputs,
+                                   outputs=outputs,
+                                   name=layer.name,
+                                   activations=activations,
+                                   activation_alpha=activation_alpha,
+                                   activation_beta=activation_beta,
+                                   direction=direction,
+                                   hidden_size=hidden_size,
+                                   output_sequence=output_sequence))
 
         return graph_input_list, weight_list, node_list
 
@@ -279,26 +397,92 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
 
+        config = layer.get_config()
+
         # onnx attribute
-        activation_alpha = None
-        activation_bata = None
-        activations = None
+
+        # no alpha and beta in Keras activation function
+        activation_alpha = [0.0, 0.0, 0.0]
+        activation_beta = [0.0, 0.0, 0.0]
+
+        # the activation function order is f, g, h in onnx
+        # coresponding is recurrent_activation, activation, activation in keras
+        activations = [config['activation'], config['activation'], config['activation']]
+
+        # no clip in Keras
         clip = None
-        direction = None
-        hidden_size = None
-        output_sequence = None
+
+        if config['go_backwards']:
+            direction = "reverse"
+        else:
+            direction = "forward"
+
+        hidden_size = config['units']
+
+        output_sequence = 0
+        if config['return_sequences']:
+            output_sequence = 1
 
         # onnx input
-        X = None
-        W = None
-        R = None
-        B = None
+        # however W,R,B matrix order is [i f c o] in keras
+        # the W,R,B matrix order is [i o f c] in onnx
+        symbolic_weights = layer.weights
+        weights_values = K.batch_get_value(symbolic_weights)
+
+        W_name = symbolic_weights[0].name
+        W_weight = weights_values[0]
+        W_weight = np.concatenate(
+            (W_weight[:, :hidden_size], W_weight[:, 3 * hidden_size:], W_weight[:, hidden_size:3 * hidden_size]),
+            axis=1)
+        graph_input_list.append(cls.make_symbolic_weights(W_name, W_weight))
+        weight_list.append(cls.make_weights(W_name, W_weight))
+
+        R_name = symbolic_weights[1].name
+        R_weight = weights_values[0]
+        R_weight = np.concatenate(
+            (R_weight[:, :hidden_size], R_weight[:, 3 * hidden_size:], R_weight[:, hidden_size:3 * hidden_size]),
+            axis=1)
+        graph_input_list.append(cls.make_symbolic_weights(R_name, R_weight))
+        weight_list.append(cls.make_weights(R_name, R_weight))
+
+        X = layer.input.name
+        inputs = [X, W_name, R_name]
+
+        if config['use_bias']:
+            B_name = symbolic_weights[2].name
+            B_weight = weights_values[2]
+            B_weight = np.concatenate(
+                (B_weight[:hidden_size], B_weight[3 * hidden_size:], B_weight[hidden_size:3 * hidden_size]), axis=0)
+            graph_input_list.append(cls.make_symbolic_weights(B_name, B_weight))
+            weight_list.append(cls.make_weights(B_name, B_weight))
+
+            inputs.append(B_name)
+
+        # these inputs are not used
         sequence_lens = None
         initial_h = None
+        inital_c = None
+        P = None
 
         # onnx output
-        Y = None
-        Y_h = None
+        # Y represent all intermediate value
+        # Y should used when return_sequences is true
+        # T_h represent last output value of hidden
+        # set by return_sequence
+
+        Y = layer.output.name
+        outputs = [Y]
+
+        node_list.append(make_node("RNN",
+                                   inputs=inputs,
+                                   outputs=outputs,
+                                   name=layer.name,
+                                   activations=activations,
+                                   activation_alpha=activation_alpha,
+                                   activation_beta=activation_beta,
+                                   direction=direction,
+                                   hidden_size=hidden_size,
+                                   output_sequence=output_sequence))
 
         return graph_input_list, weight_list, node_list
 
@@ -415,8 +599,6 @@ class KerasFrontend(object):
         dilations = list(config['dilation_rate'])
         # TODO need a function to convert same or valid into pads
         # pads = []
-
-
 
         # onnx node outputs
         outputs = [layer.output.name]
@@ -825,9 +1007,9 @@ class KerasFrontend(object):
         # onnx input
 
         shape_weights = np.array(config['target_shape'])
-        shape_name = layer.name +"/shape"
-        weight_list.append(cls.make_weights(shape_name,shape_weights))
-        graph_input_list.append(cls.make_symbolic_weights(shape_name,shape_weights))
+        shape_name = layer.name + "/shape"
+        weight_list.append(cls.make_weights(shape_name, shape_weights))
+        graph_input_list.append(cls.make_symbolic_weights(shape_name, shape_weights))
 
         node = make_node("Reshape",
                          inputs=[layer.input.name],
