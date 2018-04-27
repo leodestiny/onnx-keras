@@ -49,6 +49,7 @@ class KerasFrontend(object):
             GlobalMaxPooling2D: cls.create_global_max_pooling2D,
             GlobalAveragePooling1D: cls.create_global_average_pooling1D,
             GlobalAveragePooling2D: cls.create_global_average_pooling2D,
+            Add:cls.create_add,
             Subtract: cls.create_sub,
             Multiply: cls.create_mul,
             Maximum: cls.create_max,
@@ -56,7 +57,11 @@ class KerasFrontend(object):
             LeakyReLU: cls.create_leaky_relu,
             PReLU: cls.create_prelu,
             ELU: cls.create_elu,
-            ThresholdedReLU: cls.create_threshoulded_relu
+            ThresholdedReLU: cls.create_threshoulded_relu,
+            Dropout: cls.create_dropout,
+            Flatten: cls.create_flatten,
+            Reshape: cls.create_reshape,
+            BatchNormalization: cls.create_batch_normalization
         }
         activation_to_handler = {
             "softmax": cls.create_softmax,
@@ -71,28 +76,23 @@ class KerasFrontend(object):
 
         if layer.__class__ in class_to_handler:
             return class_to_handler[layer.__class__]
-        elif layer.__class__ == Activation:
-            return activation_to_handler[layer.get_config()['activation']]
+        elif layer.__class__ == Activation :
+            if layer.get_config()['activation'] in activation_to_handler:
+                return activation_to_handler[layer.get_config()['activation']]
+            else:
+                raise NotImplementedError("This activation %s is not supported in this version" % (layer.get_config()['activation']))
         else:
             raise NotImplementedError("This layer %s is not supported in this version" % (layer.__class__))
 
     @classmethod
     def keras_model_to_onnx_model(cls, model,
-                                  opset=0,
                                   producer_name="onnx-keras",
                                   model_name="keras-model"):
 
         # TODO save domain, model_version,doc_string
 
-        # opset_import
-        if opset == 0:
-            opset = 6
-
-        opsetid = make_opsetid(domain="onnx-keras",
-                               version=6)
 
         model = make_model(cls.keras_graph_to_onnx_graph(model),
-                           opset_imports=[opsetid],
                            model_version=1,
                            producer_name=producer_name)
         check_model(model)
@@ -123,8 +123,8 @@ class KerasFrontend(object):
         # save all weights into initializer
         initializer = []
 
-        for layer in model.layers:
-
+        for i,layer in enumerate(model.layers):
+            print(i)
             # the InputLayer only contain input data of model
             if isinstance(layer, InputLayer):
                 # TODO input maybe a channel last?
@@ -136,10 +136,6 @@ class KerasFrontend(object):
                 nodes.extend(node_list)
                 graph_inputs.extend(graph_input_list)
                 initializer.extend(weight_list)
-            pass
-        pass
-
-        print(graph_inputs)
 
         return make_graph(nodes=nodes,
                           name="test",
@@ -160,41 +156,49 @@ class KerasFrontend(object):
         momentum = config['momentum']
         spatial = 1  # default value in onnx
 
-        # TODO deal with center and scale flag, now assume center and scale is true
-        # current, the order of weights is : [gamma(scale),_beta(bias), mean, variance]
-
+        # weights
         symbolic_weights = layer.weights
         weights_values = K.batch_get_value(symbolic_weights)
 
-        scale_name = symbolic_weights[0].name
-        B_name = symbolic_weights[1].name
-        mean_name = symbolic_weights[2].name
-        var_name = symbolic_weights[3].name
-
-        scale_weight, B_weight, mean_weight, var_weight = weights_values
-
-        graph_input_list.extend([scale_name, B_name, mean_name, var_name])
-
-        weight_list.append(cls.make_weights(scale_name, scale_weight))
-        weight_list.append(cls.make_weights(B_name, B_weight))
-        weight_list.append(cls.make_weights(mean_name, mean_weight))
-        weight_list.append(cls.make_weights(var_name, var_weight))
-
         # onnx inputs
         X_name = layer.input.name
-        inputs = [X_name, scale_name, B_name, mean_name, var_name]
+        inputs = [X_name]
+
+        if config['center'] and config['scale']:
+            # the order of weights is : [gamma(scale),beta(bias), mean, variance]
+            scale_name = symbolic_weights[0].name
+            B_name = symbolic_weights[1].name
+            mean_name = symbolic_weights[2].name
+            var_name = symbolic_weights[3].name
+
+            scale_weight, B_weight, mean_weight, var_weight = weights_values
+
+            graph_input_list.append(cls.make_symbolic_weights(scale_name, scale_weight))
+            graph_input_list.append(cls.make_symbolic_weights(B_name, B_weight))
+            graph_input_list.append(cls.make_symbolic_weights(mean_name, mean_weight))
+            graph_input_list.append(cls.make_symbolic_weights(var_name, var_weight))
+
+            weight_list.append(cls.make_weights(scale_name, scale_weight))
+            weight_list.append(cls.make_weights(B_name, B_weight))
+            weight_list.append(cls.make_weights(mean_name, mean_weight))
+            weight_list.append(cls.make_weights(var_name, var_weight))
+            inputs.extend([scale_name, B_name, mean_name, var_name])
+        else:
+            raise NotImplementedError("ONNX need both center and scale must be True")
+
 
         # onnx outpus
         # notate onnx has other opitional output, but there is only one output in keras
         Y_name = layer.output.name
-        outpus = [Y_name]
+        outputs = [Y_name]
 
         node = make_node("BatchNormalization",
                          inputs=inputs,
-                         outputs=outpus,
+                         outputs=outputs,
                          name=layer.name,
                          epsilon=epsilon,
                          momentum=momentum,
+                         consumed_inputs=[0,0,0,1,1],
                          spatial=spatial)
         node_list.append(node)
 
@@ -209,6 +213,8 @@ class KerasFrontend(object):
         # onnx attribute
         activation_alpha = None
         activation_bata = None
+        # the activation function order is f, g, h in onnx
+        # coresponding is recurrent_activation, activation, activation
         activations = None
         clip = None
         direction = None
@@ -216,16 +222,22 @@ class KerasFrontend(object):
         output_sequence = None
 
         # onnx input
+        # the W,R,B matrix order is [i o f c] in onnx
+        # however W,R,B matrix order is [i f c o] in keras
         X = None
         W = None
         R = None
+        #TODO use_bias is true or false
         B = None
         sequence_lens = None
         initial_h = None
         inital_c = None
+        # P is not used
         P = None
 
         # onnx output
+
+        # set by return_sequence
         Y = None
         Y_h = None
         Y_c = None
@@ -351,7 +363,7 @@ class KerasFrontend(object):
 
         activation_node = make_node(rename_operator[config['activation']],
                                     inputs=[new_input],
-                                    outputs=[layer.outputs],
+                                    outputs=[layer.output.name],
                                     name=layer.name + '/' + config['activation'])
 
         return activation_node
@@ -370,13 +382,8 @@ class KerasFrontend(object):
         weights_values = K.batch_get_value(symbolic_weights)
 
         kernel_name = symbolic_weights[0].name
-        bias_name = symbolic_weights[1].name
-
-        kernel_weight, bias_weight = weights_values
-
+        kernel_weight = weights_values[0]
         graph_input_list.append(cls.make_symbolic_weights(kernel_name, kernel_weight))
-        graph_input_list.append(cls.make_symbolic_weights(bias_name, bias_weight))
-
         # convert kernel shape to onnx
         # [(kernel shape), channels, filters] -> [filters, channels, (kernel shape)]
         dims = list(range(np.ndim(kernel_weight)))
@@ -386,11 +393,18 @@ class KerasFrontend(object):
                                        data_type=NP_TYPE_TO_TENSOR_TYPE[kernel_weight.dtype],
                                        dims=kernel_weight.shape,
                                        vals=kernel_weight.flatten().tolist()))
+        # onnx node inputs
+        inputs = [layer.input.name, kernel_name]
 
-        weight_list.append(make_tensor(name=bias_name,
-                                       data_type=NP_TYPE_TO_TENSOR_TYPE[bias_weight.dtype],
-                                       dims=bias_weight.shape,
-                                       vals=bias_weight.flatten().tolist()))
+        if config['use_bias']:
+            bias_name = symbolic_weights[1].name
+            kernel_weight, bias_weight = weights_values
+            graph_input_list.append(cls.make_symbolic_weights(bias_name, bias_weight))
+            weight_list.append(make_tensor(name=bias_name,
+                                           data_type=NP_TYPE_TO_TENSOR_TYPE[bias_weight.dtype],
+                                           dims=bias_weight.shape,
+                                           vals=bias_weight.flatten().tolist()))
+            inputs.append(bias_name)
 
         # get onnx attribute from keras config
         strides = list(config['strides'])
@@ -402,8 +416,7 @@ class KerasFrontend(object):
         # TODO need a function to convert same or valid into pads
         # pads = []
 
-        # onnx node inputs
-        inputs = [layer.input.name, kernel_name, bias_name]
+
 
         # onnx node outputs
         outputs = [layer.output.name]
@@ -423,10 +436,10 @@ class KerasFrontend(object):
         else:
             # this Conv layer contain a activation function
             # add a extra activation node
-            conv_outputs_name = [layer.name + "_conv_output"]
+            conv_outputs_name = layer.name + "_conv_output"
             conv_node = make_node("Conv",
                                   inputs=inputs,
-                                  outputs=conv_outputs_name,
+                                  outputs=[conv_outputs_name],
                                   name=layer.name,
                                   auto_pad=auto_pad,
                                   kernel_shape=kernel_shape,
@@ -453,20 +466,22 @@ class KerasFrontend(object):
         weights_values = K.batch_get_value(symbolic_weights)
 
         kernel_name = symbolic_weights[0].name
-        bias_name = symbolic_weights[1].name
-
-        kernel_weight, bias_weight = weights_values
-
+        kernel_weight = weights_values[0]
         graph_input_list.append(cls.make_symbolic_weights(kernel_name, kernel_weight))
-        graph_input_list.append(cls.make_symbolic_weights(bias_name, bias_weight))
-
         # convert kernel shape to onnx
         # [(kernel shape), channels, filters] -> [filters, channels, (kernel shape)]
         dims = list(range(np.ndim(kernel_weight)))
         kernel_weight = np.transpose(kernel_weight, axes=dims[-2:][::-1] + dims[:-2])
-
         weight_list.append(cls.make_weights(kernel_name, kernel_weight))
-        weight_list.append(cls.make_weights(bias_name, bias_weight))
+
+        inputs = [layer.input.name, kernel_name]
+
+        if config['use_bias']:
+            bias_name = symbolic_weights[1].name
+            bias_weight = weights_values[1]
+            graph_input_list.append(cls.make_symbolic_weights(bias_name, bias_weight))
+            weight_list.append(cls.make_weights(bias_name, bias_weight))
+            inputs.append(bias_name)
 
         # get onnx attribute from keras config
         strides = list(config['strides'])
@@ -474,11 +489,8 @@ class KerasFrontend(object):
         if config['padding'] == "valid":
             auto_pad = "VALID"
         kernel_shape = list(config['kernel_size'])
-        dilations = list(config['dilation_rate'])
         # TODO need a function to convert same or valid into pads
         # pads = []
-
-        inputs = [layer.input.name, kernel_name, bias_name]
 
         outputs = [layer.output.name]
 
@@ -490,21 +502,19 @@ class KerasFrontend(object):
                 name=layer.name,
                 auto_pad=auto_pad,
                 kernel_shape=kernel_shape,
-                dilations=dilations,
                 strides=strides
             )
             node_list.append(node)
         else:
             # this Conv layer contain a activation function
             # add a extra activation node
-            conv_outputs_name = [layer.name + "_conv_trans_output"]
+            conv_outputs_name = layer.name + "_conv_trans_output"
             conv_node = make_node("ConvTranspose",
                                   inputs=inputs,
-                                  outputs=conv_outputs_name,
+                                  outputs=[conv_outputs_name],
                                   name=layer.name,
                                   auto_pad=auto_pad,
                                   kernel_shape=kernel_shape,
-                                  dilations=dilations,
                                   strides=strides)
             extra_node = cls.create_extra_activation(layer, conv_outputs_name)
             node_list.extend([conv_node, extra_node])
@@ -584,7 +594,7 @@ class KerasFrontend(object):
         mode = "constant"
         # however, pads, in onnx ,is like [begin0, begin1, begin2, ... ,end0, end1]
         pads = np.asarray(padding).transpose().flatten().tolist()
-        value = 0
+        value = 0.0
 
         # onnx input
         inputs = [layer.input.name]
@@ -619,8 +629,8 @@ class KerasFrontend(object):
         pool_shape = list(config['pool_size'])
 
         # onnx inputs
-        inputs = [layer.input]
-        outputs = [layer.output]
+        inputs = [layer.input.name]
+        outputs = [layer.output.name]
 
         node = make_node("MaxPool",
                          inputs=inputs,
@@ -798,10 +808,10 @@ class KerasFrontend(object):
         weight_list = []
 
         node = make_node("Dropout",
-                         inputs=layer.input,
-                         outputs=layer.output,
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name,
-                         ratio=config['ratio'])
+                         ratio=config['rate'])
         node_list.append(node)
         return graph_input_list, weight_list, node_list
 
@@ -814,10 +824,16 @@ class KerasFrontend(object):
 
         # onnx input
 
+        shape_weights = np.array(config['target_shape'])
+        shape_name = layer.name +"/shape"
+        weight_list.append(cls.make_weights(shape_name,shape_weights))
+        graph_input_list.append(cls.make_symbolic_weights(shape_name,shape_weights))
+
         node = make_node("Reshape",
-                         inputs=[layer.input.name, config['target_shape']],
+                         inputs=[layer.input.name],
                          outputs=[layer.output.name],
-                         name=layer.name)
+                         name=layer.name,
+                         shape=shape_weights.tolist())
         node_list.append(node)
         return graph_input_list, weight_list, node_list
 
@@ -829,8 +845,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("Flatten",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name,
                          axis=0)
         node_list.append(node)
@@ -849,8 +865,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("Softmax",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name,
                          axis=1)
         node_list.append(node)
@@ -863,8 +879,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("Elu",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name,
                          alpha=1)
         node_list.append(node)
@@ -873,13 +889,12 @@ class KerasFrontend(object):
     # TODO: in ONNX there is alpha and gamma attribute
     @classmethod
     def create_selu(cls, layer):
-        config = layer.get_config()
         node_list = []
         graph_input_list = []
         weight_list = []
         node = make_node("Selu",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name, )
         node_list.append(node)
         return graph_input_list, weight_list, node_list
@@ -890,8 +905,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("Softplus",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name)
         node_list.append(node)
         return graph_input_list, weight_list, node_list
@@ -901,8 +916,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("SoftSign",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name)
         node_list.append(node)
         return graph_input_list, weight_list, node_list
@@ -913,8 +928,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("Relu",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name)
         node_list.append(node)
         return graph_input_list, weight_list, node_list
@@ -925,8 +940,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("Tanh",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name)
         node_list.append(node)
         return graph_input_list, weight_list, node_list
@@ -937,8 +952,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("Sigmoid",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name)
         node_list.append(node)
         return graph_input_list, weight_list, node_list
@@ -950,8 +965,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("HardSigmoid",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name)
         node_list.append(node)
         return graph_input_list, weight_list, node_list
@@ -964,8 +979,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("Add",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[i.name for i in layer.input],
+                         outputs=[layer.output.name],
                          name=layer.name,
                          broadcast=0)
         node_list.append(node)
@@ -977,8 +992,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("Sub",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[i.name for i in layer.input],
+                         outputs=[layer.output.name],
                          name=layer.name,
                          broadcast=0)
         node_list.append(node)
@@ -990,8 +1005,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("Mul",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[i.name for i in layer.input],
+                         outputs=[layer.output.name],
                          name=layer.name,
                          broadcast=0)
         node_list.append(node)
@@ -1002,10 +1017,12 @@ class KerasFrontend(object):
         node_list = []
         graph_input_list = []
         weight_list = []
+        config = layer.get_config()
         node = make_node("Concat",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
-                         name=layer.name)
+                         inputs=[i.name for i in layer.input],
+                         outputs=[layer.output.name],
+                         name=layer.name,
+                         axis=config['axis'])
         node_list.append(node)
         return graph_input_list, weight_list, node_list
 
@@ -1015,8 +1032,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("Max",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[i.name for i in layer.input],
+                         outputs=[layer.output.name],
                          name=layer.name)
         node_list.append(node)
         return graph_input_list, weight_list, node_list
@@ -1030,8 +1047,8 @@ class KerasFrontend(object):
         weight_list = []
         config = layer.get_config()
         node = make_node("LeakyRelu",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name,
                          alpha=config['alpha'])
         node_list.append(node)
@@ -1045,8 +1062,8 @@ class KerasFrontend(object):
         weight_list = []
         config = layer.get_config()
         node = make_node("PRelu",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name)
         node_list.append(node)
         return graph_input_list, weight_list, node_list
@@ -1058,8 +1075,8 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         node = make_node("ThreshouldedRelU",
-                         inputs=[layer.input],
-                         outputs=[layer.output],
+                         inputs=[layer.input.name],
+                         outputs=[layer.output.name],
                          name=layer.name,
                          alpha=config["theta"])
         node_list.append(node)
