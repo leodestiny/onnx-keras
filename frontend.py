@@ -116,9 +116,12 @@ class KerasFrontend(object):
         # this list record input of this graph
         graph_inputs = []
         for i in model.inputs:
+            shape = convert_shape(K.int_shape(i))
+            if K.image_data_format() == "channels_last":
+                shape = shape[:1] + shape[3:] + shape[1:3]
             graph_inputs.append(make_tensor_value_info(name=i.name,
                                                        elem_type=STR_TO_ONNX_TYPE[K.dtype(i)],
-                                                       shape=convert_shape(K.int_shape(i))))
+                                                       shape=shape))
 
         # save structure of the graph (all layers) into nodes
         nodes = []
@@ -567,11 +570,11 @@ class KerasFrontend(object):
 
         kernel_name = symbolic_weights[0].name
         kernel_weight = weights_values[0]
-        graph_input_list.append(cls.make_symbolic_weights(kernel_name, kernel_weight))
         # convert kernel shape to onnx
         # [(kernel shape), channels, filters] -> [filters, channels, (kernel shape)]
         dims = list(range(np.ndim(kernel_weight)))
         kernel_weight = np.transpose(kernel_weight, axes=dims[-2:][::-1] + dims[:-2])
+        graph_input_list.append(cls.make_symbolic_weights(kernel_name, kernel_weight))
 
         weight_list.append(make_tensor(name=kernel_name,
                                        data_type=NP_TYPE_TO_TENSOR_TYPE[kernel_weight.dtype],
@@ -993,7 +996,8 @@ class KerasFrontend(object):
                          inputs=[layer.input.name],
                          outputs=[layer.output.name],
                          name=layer.name,
-                         ratio=config['rate'])
+                         ratio=config['rate'],
+                         is_test =1)
         node_list.append(node)
         return graph_input_list, weight_list, node_list
 
@@ -1200,11 +1204,14 @@ class KerasFrontend(object):
         graph_input_list = []
         weight_list = []
         config = layer.get_config()
+        axis = config['axis']
+        if K.image_data_format() == "channels_last":
+            axis = 1
         node = make_node("Concat",
                          inputs=[i.name for i in layer.input],
                          outputs=[layer.output.name],
                          name=layer.name,
-                         axis=config['axis'])
+                         axis=axis)
         node_list.append(node)
         return graph_input_list, weight_list, node_list
 

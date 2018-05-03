@@ -283,7 +283,7 @@ class KerasBackend(Backend):
 
       shape = list(d.dim_value for d in
                    value_info.type.tensor_type.shape.dim)
-      x = Input(shape=shape[1:],  name=value_info.name, dtype=
+      x = Input(shape=shape[1:], dtype=
       cls.tensor_type_enum[value_info.type.tensor_type.elem_type])
 
       input_dict_items.append([value_info.name, x])
@@ -302,7 +302,11 @@ class KerasBackend(Backend):
     original_input_dict = dict(input_dict_items)
     output_dict = dict()
 
+    cnt = 0
+
     for node in graph_def.node:
+      cnt += 1
+      print(cnt)
       node = OnnxNode(node)
 
       output_ops = cls._onnx_node_to_keras_op(node, input_dict)
