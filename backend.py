@@ -15,12 +15,12 @@ import itertools
 from math import ceil, floor
 
 try:
-  from itertools import izip as zip
+    from itertools import izip as zip
 except ImportError: # will be 3.x series
-  pass
+    pass
 
 import numpy as np
-from onnx import checker
+from onnx import checker,onnx_pb2, helper
 from onnx.onnx_pb2 import GraphProto, TensorProto, AttributeProto
 import onnx.numpy_helper
 import onnx.defs
@@ -38,82 +38,33 @@ from onnx.backend.base import (
     namedtupledict,
 )
 
-from onnx import onnx_pb2, helper
-import tensorflow as tf
-from tensorflow.python.client import device_lib
 
-# TODO: allow more flexible placement
-def get_device_option(device):
-  m = {DeviceType.CPU: '/cpu',
-       DeviceType.CUDA: '/gpu'}
-  return m[device.type]
-
-# TODO: Move this into ONNX main library
 def convertAttributeProto(onnx_arg):
-  """
-  Convert an ONNX AttributeProto into an appropriate Python object
-  for the type.
-  NB: Tensor attribute gets returned as the straight proto.
-  """
-  if onnx_arg.HasField('f'):
-    return onnx_arg.f
-  elif onnx_arg.HasField('i'):
-    return onnx_arg.i
-  elif onnx_arg.HasField('s'):
-    return str(onnx_arg.s, 'utf-8') \
-      if sys.version_info[0] >= 3 else onnx_arg.s
-  elif onnx_arg.HasField('t'):
-    return onnx_arg.t  # this is a proto!
-  elif onnx_arg.floats:
-    return list(onnx_arg.floats)
-  elif onnx_arg.ints:
-    return list(onnx_arg.ints)
-  elif onnx_arg.strings:
-    str_list = list(onnx_arg.strings)
-    if sys.version_info[0] >= 3:
-      str_list = map(lambda x: str(x, 'utf-8'), str_list)
-    return str_list
-  else:
-    raise ValueError("Unsupported ONNX attribute: {}".format(onnx_arg))
-
-class OnnxAttributes(dict):
-  """
-  This is a more convenient way to work with ONNX/Caffe2 attributes
-  that is not the protobuf representation.
-  """
-  @staticmethod
-  def from_onnx(args):
-    d = OnnxAttributes()
-    for arg in args:
-      d[arg.name] = convertAttributeProto(arg)
-    return d
-
-  def caffe2(self, kmap=lambda x: x):
-    for k, v in self.items():
-      yield caffe2.python.utils.MakeArgument(kmap(k), v)
-
-# TODO: Move this into ONNX main library
-class OnnxNode(object):
-  """
-  Reimplementation of NodeProto from ONNX, but in a form
-  more convenient to work with from Python.
-  We may temporarily edit these nodes to get them into Caffe2 form,
-  before actually translating into the Caffe2 protobuf, since this
-  is easier than decomposing everything, and putting it back together
-  when we're ready.
-  """
-  def __init__(self, node):
-    # print('---------------node intro----------')
-    # print(type(node))
-    # print(node)
-    # print('--------------node end-------------')
-    self.name = str(node.name)
-    self.op_type = str(node.op_type)
-    self.attrs = OnnxAttributes.from_onnx(node.attribute)
-    self.consumed_inputs = self.attrs.pop("consumed_inputs", None)
-    self.inputs = list(node.input)
-    self.outputs = list(node.output)
-    self.node_proto = node
+    """
+    Convert an ONNX AttributeProto into an appropriate Python object
+    for the type.
+    NB: Tensor attribute gets returned as the straight proto.
+    """
+    if onnx_arg.HasField('f'):
+        return onnx_arg.f
+    elif onnx_arg.HasField('i'):
+        return onnx_arg.i
+    elif onnx_arg.HasField('s'):
+        return str(onnx_arg.s, 'utf-8') \
+            if sys.version_info[0] >= 3 else onnx_arg.s
+    elif onnx_arg.HasField('t'):
+        return onnx_arg.t  # this is a proto!
+    elif onnx_arg.floats:
+        return list(onnx_arg.floats)
+    elif onnx_arg.ints:
+        return list(onnx_arg.ints)
+    elif onnx_arg.strings:
+        str_list = list(onnx_arg.strings)
+        if sys.version_info[0] >= 3:
+            str_list = map(lambda x: str(x, 'utf-8'), str_list)
+        return str_list
+    else:
+        raise ValueError("Unsupported ONNX attribute: {}".format(onnx_arg))
 
 
 class KerasNet(object):
@@ -129,35 +80,66 @@ class KerasNet(object):
     self.output_dict = {}
 
 
+class OnnxAttributes(dict):
+    """
+    This is a more convenient way to work with ONNX/Caffe2 attributes
+    that is not the protobuf representation.
+    """
+    @staticmethod
+    def from_onnx(args):
+        d = OnnxAttributes()
+        for arg in args:
+            d[arg.name] = convertAttributeProto(arg)
+        return d
+
+
+class OnnxNode(object):
+    """
+    Reimplementation of NodeProto from ONNX, but in a form
+    more convenient to work with from Python.
+    We may temporarily edit these nodes to get them into Caffe2 form,
+    before actually translating into the Caffe2 protobuf, since this
+    is easier than decomposing everything, and putting it back together
+    when we're ready.
+    """
+    def __init__(self, node):
+        # print('---------------node intro----------')
+        # print(type(node))
+        # print(node)
+        # print('--------------node end-------------')
+        self.name = str(node.name)
+        self.op_type = str(node.op_type)
+        self.attrs = OnnxAttributes.from_onnx(node.attribute)
+        self.consumed_inputs = self.attrs.pop("consumed_inputs", None)
+        self.inputs = list(node.input)
+        self.outputs = list(node.output)
+        self.node_proto = node
+
+
 class KerasBackend(Backend):
   """ Tensorflow Backend for ONNX
   """
-  # model = Sequential()
+  extra_input = list()
+  extra_input_array = list()
 
   onnx_tf_attribute_map = {
-      "scale": "stddev",
-      "high": "maxval",
-      "low": "minval",
-      "axes": "axis",
-      # "keepdims": "keep_dims",
-      "axis": "dim",
-      "to": "dtype",
+        "scale": "stddev",
+        "high": "maxval",
+        "low": "minval",
+        "axes": "axis",
+        # "keepdims": "keep_dims",
+        "axis": "dim",
+        "to": "dtype",
   }
-
-  # onnx_tf_per_op_attr_map = {}
 
   onnx_keras_op_map = {
       "abs": K.abs,
       "cast": K.cast,
-      "ceil": np.ceil,
       "exp": K.exp,
-      "gather": K.gather,
       "hardsigmoid": K.hard_sigmoid,
       "log": K.log,
-      "pow": K.pow,
       "random_normal": K.random_normal,
       "random_uniform": K.random_uniform,
-      # "reciprocal": tf.reciprocal,
       "reduce_log_sum_exp": K.logsumexp,
       "reduce_max": K.max,
       "reduce_mean": K.mean,
@@ -207,40 +189,29 @@ class KerasBackend(Backend):
 
   ]
 
-  conv_func = {
-    1: keras.layers.convolutional.Conv1D,
-    2: keras.layers.convolutional.Conv2D,
-    3: keras.layers.convolutional.Conv3D,
-  }
-  zero_padding_func = {
-    1: keras.layers.convolutional.ZeroPadding1D,
-    2: keras.layers.convolutional.ZeroPadding2D,
-    3: keras.layers.convolutional.ZeroPadding3D,
-  }
-
-  type_string_to_keras_type = {
-      "float": K.floatx(),
-  }
-
   attr_translator = {
       "dtype": lambda cls, x: cls.tensor_type_to_keras_type[x],
       "keepdims": lambda cls, x: bool(x),
-      "to": lambda cls, x: cls.type_string_to_keras_type[x],
+      "to": lambda cls, x: x,
   }
 
   @classmethod
-  def get_keras_pad(cls, x, pads, data_format=None):
-    num_dim = int(len(pads) / 2)
-    pads = list(np.transpose(np.array(pads).reshape([2, num_dim]).astype(np.int32)))
-    pads = tuple(tuple(i) for i in pads)
-    if num_dim == 1:
+  def get_keras_pad(cls, x, pads, dim, data_format=None):
+    if sum(pads) == 0:
+      return x
+    if len(pads) == dim*2:
+      pads = list(np.transpose(np.array(pads).reshape([2, dim]).astype(np.int32)))
+      pads = tuple(tuple(i) for i in pads)
+    elif len(pads) == dim:
+      pads = tuple((i, i) for i in pads)
+    if dim == 1:
       return Lambda(lambda _x: K.temporal_padding(_x, pads))(x)
-    elif num_dim == 2:
+    elif dim == 2:
       return Lambda(lambda _x: K.spatial_2d_padding(_x, pads, data_format))(x)
-    elif num_dim == 3:
+    elif dim == 3:
       return Lambda(lambda _x: K.spatial_3d_padding(_x, pads, data_format))(x)
     else:
-      raise NotImplementedError("padding with dim {} is not implemented.".format(num_dim))
+      raise NotImplementedError("padding with dim {} is not implemented.".format(dim))
 
   @classmethod
   def _explicit_broadcast(cls, tensor, broadcast_dim=1, total_num_dim=4):
@@ -257,15 +228,25 @@ class KerasBackend(Backend):
   def _bin_op(cls, node, input_dict, op_func, inputlist=True):
     x = input_dict[node.inputs[0]]
     y = input_dict[node.inputs[1]]
-    tmp = np.array([0])
-
-    if type(y) == type(tmp):
-        y = keras.layers.Input(y)
+    print(K.int_shape(x))
+    print(K.shape(x).shape, type(K.shape(x)))
+    if isinstance(y, np.ndarray):
+        cls.extra_input_array.append(y)
+        y = keras.layers.Input(shape=y.shape)
+        cls.extra_input.append(y)
     broadcast = node.attrs.get("broadcast", 1)
     if broadcast == 0:
       warnings.warn("Definition of {} with broadcast disabled is not "
                     "yet supported.".format(node.type), UserWarning)
+    if "axis" in node.attrs.keys():
+      num_ones_to_append = len(x.get_shape()) - \
+                           len(y.get_shape()) - \
+                           node.attrs["axis"] + 1
+      if num_ones_to_append > 0:
 
+        ones = np.ones([num_ones_to_append], 'int32')
+        broadcasted_shape = np.concatenate([K.int_shape(y)[1:], ones], axis=0)
+        y = keras.layers.Reshape(broadcasted_shape)(y)
 
     if inputlist:
       return op_func([x, y])
@@ -294,6 +275,7 @@ class KerasBackend(Backend):
         value_info.name for value_info in graph_def.input)
     predict_net.external_output.extend(
         value_info.name for value_info in graph_def.output)
+    print(predict_net.external_output)
     # creating placeholders for currently unkown inputs
     for value_info in graph_def.input:
       if value_info.name in initialized:
@@ -301,12 +283,9 @@ class KerasBackend(Backend):
 
       shape = list(d.dim_value for d in
                    value_info.type.tensor_type.shape.dim)
-
-      x = Input(shape=shape[1:], name=value_info.name, dtype=
+      x = Input(shape=shape[1:],  name=value_info.name, dtype=
       cls.tensor_type_enum[value_info.type.tensor_type.elem_type])
-      # x = tf.placeholder(cls.tensor_type_enum[
-      #     value_info.type.tensor_type.elem_type],
-      #                    name=value_info.name, shape=shape)
+
       input_dict_items.append([value_info.name, x])
 
     # input dict: this dictionary is a map from variable names
@@ -334,10 +313,7 @@ class KerasBackend(Backend):
       output_dict = dict(list(output_dict.items()) +
                          curr_node_output_map)
       predict_net.op.extend(output_ops)
-      # print(output_ops)
-      # print(curr_node_output_map)
-      # print(input_dict)
-      # print('output_dict', output_dict)
+
     predict_net.output_dict = output_dict
     return original_input_dict, predict_net
 
@@ -355,11 +331,11 @@ class KerasBackend(Backend):
     inputs = [original_input_dict[a] for a in uninitialized]
     outputs = [predict_net.output_dict[a] for a in predict_net.external_output]
 
-    res_model = Model(inputs=inputs,
+    res_model = Model(inputs=inputs+cls.extra_input,
                       outputs=outputs)
-    print(res_model.layers)
 
-    # print(predict_net, original_input_dict, uninitialized)
+    print(res_model.layers)
+    return res_model
     # return TensorflowRep(predict_net, original_input_dict, uninitialized)
 
   @classmethod
@@ -369,7 +345,6 @@ class KerasBackend(Backend):
 
     def tensor2list(onnx_tensor):
       # Use the onnx.numpy_helper because the data may be raw
-      # return onnx.numpy_helper.to_array(onnx_tensor).flatten().tolist()
       return onnx.numpy_helper.to_array(onnx_tensor).tolist()
     input_dict = [(tp.name, np.array(tensor2list(tp))) for tp in initializer]
 
@@ -389,14 +364,47 @@ class KerasBackend(Backend):
     # Check if specialized handler exists.
     if handler_name in dir(cls):
       method_to_call = getattr(cls, handler_name)
-      return method_to_call(node, input_dict)
+      tmp = method_to_call(node, input_dict)
+      # print('check', K.is_keras_tensor(tmp[0]), tmp[0])
+      return tmp
     else:
       raise NotImplementedError("{} op is not implemented.".format(node.op_type))
 
   @classmethod
+  def run_node(cls, node, inputs, uninit=[0]):
+    super(KerasBackend, cls).run_node(node, inputs)
+    node = OnnxNode(node)
+    input_tensor = list()
+    input_array = list()
+    input_dict = dict()
+    for i in range(len(inputs)):
+        input_dict[node.inputs[i]] = inputs[i]
+    for i in uninit:
+        input_array.append(inputs[i])
+        shape = list(inputs[i].shape)
+        # if len(shape) == 1:
+        #     shape = [-1, shape[0]]
+
+        x = Input(batch_shape=shape, name=node.inputs[i], dtype=str(inputs[i].dtype))
+        input_tensor.append(x)
+        input_dict[node.inputs[i]] = x
+    out = cls._onnx_node_to_keras_op(node, input_dict)[0]
+
+    model = Model(inputs=input_tensor, outputs=out)
+    if len(input_array) == 1:
+        input_array = input_array[0]
+    res = model.predict(input_array)
+    return namedtupledict('Outputs', node.outputs)(*[res])
+
+  @classmethod
+  def run_model(cls, model, inputs):
+    keras_model = cls.prepare(model)
+    inputs += cls.extra_input_array
+    res = keras_model.predict(inputs)
+    return res
+
+  @classmethod
   def handle_trivial(cls, node, input_dict):
-    # print(type(node))
-    # print(node)
     # Perform automatic attribute value translation.
     attrs = dict([(x, cls.attr_translator[x](cls, node.attrs[x]) \
       if x in cls.attr_translator else node.attrs[x]) \
@@ -406,38 +414,32 @@ class KerasBackend(Backend):
     # attribute names.
     attr_map = dict([(x, x) for x in node.attrs.keys()])
 
-    # Modify the map accoridng to onnx_tf_attribute_map.
+    # Modify the map accoridng to onnx_keras_attribute_map.
     attr_map = dict([(x, cls.onnx_tf_attribute_map[x] \
       if x in cls.onnx_tf_attribute_map.keys() else x) \
       for x in attr_map.keys()])
 
-    # TODO: Per op attribute name mapping has the final say.
-
     # Substitute attribute names in attrs.
     attrs = dict([(attr_map[x], y) for (x, y) in attrs.items()])
+
     func = cls.onnx_keras_op_map[cls.op_name_to_lower(node.op_type)]
-    if len(node.inputs) == 1:
-      inputs = input_dict[node.inputs[0]]
-    else:
-      inputs = [input_dict[name] for name in node.inputs]
+
+    inputs = input_dict[node.inputs[0]]
     res = Lambda(lambda a: func(a, *attrs))(inputs)
     return [res]
-
-    # return [cls.onnx_keras_op_map[cls.op_name_to_lower(node.op_type)] \
-    #   (*inputs, **attrs)]
 
   @classmethod
   def handle_add(cls, node, input_dict):
     x = input_dict[node.inputs[0]]
     y = input_dict[node.inputs[1]]
-    tmp = np.array([0])
+    # tmp = np.array([0])
+    #
+    # if type(y) == type(tmp):
+    #   total_num_dim = len(x.get_shape())
+    #   y = cls._explicit_broadcast(y,0,total_num_dim-1)
+    #   return [Lambda(lambda a: K.bias_add(a, K.constant(y)))(x)]
 
-    if type(y) == type(tmp):
-      total_num_dim = len(x.get_shape())
-      y = cls._explicit_broadcast(y,0,total_num_dim-1)
-      return [Lambda(lambda a: K.bias_add(a, K.constant(y)))(x)]
-
-    return [cls._bin_op(node, input_dict, keras.layers.add)]  # is layers.add right?
+    return [cls._bin_op(node, input_dict, keras.layers.add)]
 
   @classmethod
   def handle_arg_max(cls, node, input_dict):
@@ -446,7 +448,7 @@ class KerasBackend(Backend):
     keepdims = node.attrs.get("keepdims", 1)
     if keepdims == 1:
       warnings.warn("Definition of ArgMax with keepdims enabled is "
-                    "incompatible between onnx and tensorflow.",
+                    "incompatible between onnx and keras.",
                     UserWarning)
 
     return [Lambda(lambda x: K.argmax(x, axis=axis))(data)]
@@ -458,26 +460,30 @@ class KerasBackend(Backend):
     keepdims = node.attrs.get("keepdims", 1)
     if keepdims == 1:
       warnings.warn("Definition of ArgMin with keepdims enabled is "
-                    "incompatible between onnx and tensorflow.",
+                    "incompatible between onnx and keras.",
                     UserWarning)
-      return [Lambda(lambda x: K.argmin(x, axis=axis))(data)]
+    return [Lambda(lambda x: K.argmin(x, axis=axis))(data)]
 
   @classmethod
   def _pool(cls, node, input_dict, pool_layer):
 
     x = input_dict[node.inputs[0]]
     x_rank = len(x.get_shape())
-
-    support_cuda = cls.supports_device("CUDA")
-    # storage_format, compute_format = cls.get_data_format(x_rank, support_cuda)
-
     kernel_shape = node.attrs["kernel_shape"]
     kernel_shape = tuple(kernel_shape)
     strides = node.attrs["strides"]
 
     data_format = "channels_first"
+
+    if "auto_pad" in node.attrs.keys():
+        if node.attrs['auto_pad'] == 'SAME_UPPER':
+            return [pool_layer(pool_size=kernel_shape, strides=strides,
+                              padding='same', data_format=data_format)(x)]
+        elif node.attrs['auto_pad'] == 'SAME_LOWER':
+            raise NotImplementedError('same_lower auto_pad is not implemented')
+
     if "pads" in node.attrs.keys():
-        x = cls.get_keras_pad(x, node.attrs["pads"], data_format)
+        x = cls.get_keras_pad(x, node.attrs["pads"], x_rank-2, data_format)
 
     pooled = pool_layer(pool_size=kernel_shape, strides=strides, data_format=data_format)(x)
 
@@ -500,27 +506,24 @@ class KerasBackend(Backend):
   @classmethod
   def handle_batch_normalization(cls, node, input_dict):
     x = input_dict[node.inputs[0]]
-    total_num_dim = len(x.get_shape())
-    scale = cls._explicit_broadcast(input_dict[node.inputs[1]], 1, total_num_dim)
-    bias = cls._explicit_broadcast(input_dict[node.inputs[2]], 1, total_num_dim)
-    mean = cls._explicit_broadcast(input_dict[node.inputs[3]], 1, total_num_dim)
-    variance = cls._explicit_broadcast(input_dict[node.inputs[4]], 1, total_num_dim)
-    keras.layers.BatchNormalization
-    variance_epsilon = node.attrs.get("epsilon", 0.00001)
-    if node.attrs.get("is_test", 0):
-      return [tf.nn.batch_normalization(x, mean, variance, bias, scale,
-                                        variance_epsilon)]
-    if "momentum" in node.attrs.keys():
-      warnings.warn("Unsupported momentum attribute by Tensorflow in "
-                    "batch_normalization. This attribute will be ignored.",
-                    UserWarning)
+    scale = input_dict[node.inputs[1]]
+    bias = input_dict[node.inputs[2]]
+    mean = input_dict[node.inputs[3]]
+    variance = input_dict[node.inputs[4]]
+
+    epsilon = node.attrs.get("epsilon", 0.00001)
+    momentum = node.attrs.get("momentum", 0.9)
+
+    # TODO is_test attr
     if "spatial" in node.attrs.keys():
-      warnings.warn("Unsupported spatial attribute by Tensorflow in "
+      warnings.warn("Unsupported spatial attribute by keras in "
                     "batch_normalization. This attribute will be ignored.",
                     UserWarning)
-    # TODO: need to conform to the documentation here
-    return [tf.nn.batch_normalization(x, mean, variance, bias, scale,
-                                      variance_epsilon)]
+
+    # print('bn', K.int_shape(x), scale.shape, bias.shape, mean.shape, variance.shape)
+    return [keras.layers.BatchNormalization(axis=1, momentum=momentum, epsilon=epsilon,
+                                            weights=[scale, bias, mean, variance])(x)]
+
   @classmethod
   def handle_clip(cls, node, input_dict):
     assert "max" in node.attrs.keys()
@@ -535,47 +538,49 @@ class KerasBackend(Backend):
   def handle_concat(cls, node, input_dict):
     values = [input_dict[a] for a in node.inputs]
     axis = node.attrs.get("axis", 1)
-    return [keras.layers.concatenate(values, axis=axis)]
 
-  @classmethod
-  def get_perm_from_formats(cls, _from, _to):
-    return list(map(lambda x: _from.find(x), _to))
+    return [keras.layers.concatenate(values, axis=axis)]
 
   @classmethod
   def _conv(cls, node, input_dict, transpose=False):
     x = input_dict[node.inputs[0]]
 
     x_rank = len(x.get_shape())
-    print('_conv', x_rank, x.get_shape())
+
     dim = x_rank - 2
     if dim > 4 or dim < 1:
       raise NotImplementedError('conv of dim {} is not implemented.'.format((dim)))
     data_format = 'channels_first'
-    # support_cuda = cls.supports_device("CUDA")
-    # print('support_cuda,', support_cuda)
-    # data_format = cls.get_data_format(support_cuda)
 
     W_weights = input_dict[node.inputs[1]]
 
     filters = len(W_weights)
     W_weights = np.transpose(W_weights, [2, 3, 1, 0])
-    dilations = node.attrs.get("dilations", None)
-    strides = node.attrs.get("strides", None)
+    dilations = node.attrs.get("dilations", [1]*dim)
+    strides = node.attrs.get("strides", [1]*dim)
     kernel_size = node.attrs.get("kernel_shape")
     if "group" in node.attrs and node.attrs['group'] != 1:
       raise NotImplementedError("'group' attribute in conv is not implemented")
 
+    padding='valid'
+
+    if "auto_pad" in node.attrs.keys():
+        if node.attrs['auto_pad'] == 'SAME_UPPER':
+            padding = 'same'
+        elif node.attrs['auto_pad'] == 'SAME_LOWER':
+            raise NotImplementedError('same_lower auto_pad is not implemented')
+
     if "pads" in node.attrs.keys():
-      x = cls.get_keras_pad(x, node.attrs["pads"], data_format)
+      x = cls.get_keras_pad(x, node.attrs["pads"], dim, data_format)
 
     if len(node.inputs) == 2:
       convolved = keras.layers.convolutional._Conv(
-        rank=dim, filters=filters, kernel_size=kernel_size, data_format=data_format,
+        rank=dim, filters=filters, kernel_size=kernel_size, data_format=data_format, padding=padding,
         dilation_rate=dilations, strides=strides, use_bias=False, weights=[W_weights])(x)
     else:
       bias = input_dict[node.inputs[2]]
       convolved = keras.layers.convolutional._Conv(
-        rank=dim, filters=filters, kernel_size=kernel_size, data_format=data_format,
+        rank=dim, filters=filters, kernel_size=kernel_size, data_format=data_format, padding=padding,
         dilation_rate=dilations, strides=strides, use_bias=True, weights=[W_weights, bias])(x)
 
     return [convolved]
@@ -600,11 +605,12 @@ class KerasBackend(Backend):
 
     alpha = node.attrs.get("alpha", 1.0)
 
-    return [Lambda(lambda a: K.elu(a, alpha))(x)]
+    return [keras.layers.advanced_activations.ELU(alpha)(x)]
 
   @classmethod
   def handle_equal(cls, node, input_dict):
-    return [cls._bin_op(node, input_dict, Lambda(lambda x, y: K.equal(x, y)), inputlist=False)]
+    # TODO attr broadcast
+    return [cls._bin_op(node, input_dict, Lambda(lambda x: K.equal(x[0], x[1])), inputlist=True)]
 
   @classmethod
   def handle_greater(cls, node, input_dict):
@@ -618,12 +624,29 @@ class KerasBackend(Backend):
   def handle_flatten(cls, node, input_dict):
     tensor = input_dict[node.inputs[0]]
     axis = node.attrs["axis"] if "axis" in node.attrs.keys() else 1
-    shape = K.int_shape(tensor)
-    split0, split1 = np.split(shape, [axis, np.size(shape) - axis])
-    split0 = np.prod(split0)
-    split1 = np.prod(split1)
-    output_shape = np.stack([split0, split1])
+    shape = K.int_shape(tensor)[1:]
+
+    axis -= 1
+    split0, split1 = np.split(shape, [axis])
+    if len(split0) == 0:
+        split1 = np.prod(split1)
+        output_shape = np.array([split1])
+    else:
+        split0 = np.prod(split0)
+        split1 = np.prod(split1)
+        output_shape = np.stack([split0, split1])
     return [keras.layers.core.Reshape(output_shape)(tensor)]
+
+  @classmethod
+  def handle_gather(cls, node, input_dict):
+      x = input_dict[node.inputs[0]]
+
+      y = input_dict[node.inputs[1]]
+      axis = node.attrs.get(['axis'], 0)
+      if axis != 0:
+          raise NotImplementedError
+      return [Lambda(lambda _x, _y: K.gather(_x, _y))(x, y)]
+
 
   @classmethod
   def handle_gemm(cls, node, input_dict):
@@ -654,8 +677,11 @@ class KerasBackend(Backend):
     elif dim == 3:
       pool = keras.layers.GlobalAveragePooling3D
     else:
-      raise NotImplementedError('max pooling with dim {} is not implemented.'.format(dim))
-    return [pool(data_format=data_format)(x)]
+      raise NotImplementedError('global avgpooling with dim {} is not implemented.'.format(dim))
+    res = pool(data_format=data_format)(x)
+    shape = list(K.int_shape(res))[1:] + [1] * dim
+    res = keras.layers.Reshape(shape)(res)
+    return [res]
 
   @classmethod
   def handle_global_max_pool(cls, node, input_dict):
@@ -669,20 +695,17 @@ class KerasBackend(Backend):
     elif dim == 3:
       pool = keras.layers.GlobalMaxPooling3D
     else:
-      raise NotImplementedError('max pooling with dim {} is not implemented.'.format(dim))
-    return [pool(data_format=data_format)(x)]
+      raise NotImplementedError('global maxpooling with dim {} is not implemented.'.format(dim))
+    res = pool(data_format=data_format)(x)
+    shape = list(K.int_shape(res))[1:] + [1] * dim
+    res = keras.layers.Reshape(shape)(res)
+    return [res]
 
   @classmethod
   def handle_leaky_relu(cls, node, input_dict):
     x = input_dict[node.inputs[0]]
-    if not "alpha" in node.attrs.keys():
-      warnings.warn("Provide an alpha value.", UserWarning)
-      alpha = 1.0
-    else:
-      alpha = node.attrs["alpha"]
-
-    return [keras.layers.advanced_activations.LeakyReLU(alpha)(x)]
-
+    alpha = node.attrs.get("alpha", 1.0)
+    return [Lambda(lambda a: K.relu(a)-alpha*K.relu(-a))(x)]
 
   @classmethod
   def handle_max(cls, node, input_dict):
@@ -743,40 +766,34 @@ class KerasBackend(Backend):
     pads = node.attrs["pads"]
 
     x = input_dict[node.inputs[0]]
-
-    return [cls.get_keras_pad(x, pads)]
+    print(K.int_shape(x))
+    x = Lambda(lambda a: K.expand_dims(K.expand_dims(a, 0), 0))(x)
+    # x = Lambda(lambda a: K.reshape(a, [1,1]+list(K.int_shape(x))))(x)
+    print(K.int_shape(x))
+    x = cls.get_keras_pad(x, pads, num_dim, 'channels_first')
+    print(K.int_shape(x))
+    x = Lambda(lambda a: K.squeeze(K.squeeze(a, 0), 0))(x)
+    # x = Lambda(lambda a: K.reshape(a, list(K.int_shape(x))[2:]))(x)
+    print(K.int_shape(x))
+    # x = keras.layers.Reshape(list(K.int_shape(x))[2:])(x)
+    return [x]
 
   @classmethod
-  def handle_random_normal_like(cls, node, input_dict):
-    shape = K.int_shape(input_dict[node.inputs[0]])
-    mean = node.attrs["mean"]
-    stddev = node.attrs["scale"]
-    dtype = cls.tensor_type_to_keras_type[node.attrs["dtype"]]
-    seed = node.attrs["seed"] if "seed" in node.attrs.keys() else None
-    return [K.random_normal(shape, mean, stddev, dtype, seed)]
-
-  @classmethod
-  def handle_random_uniform_like(cls, node, input_dict):
-    shape = K.int_shape(input_dict[node.inputs[0]])
-    minval = node.attrs["low"]
-    maxval = node.attrs["high"]
-    dtype = cls.tensor_type_to_keras_type[node.attrs["dtype"]]
-    seed = node.attrs["seed"] if "seed" in node.attrs.keys() else None
-    return [K.random_uniform(shape, minval, maxval, dtype, seed)]
+  def handle_reciprocal(cls, node, input_dict):
+    return [Lambda(lambda x: 1.0/x)(input_dict[node.inputs[0]])]
 
   @classmethod
   def handle_reduce_l1(cls, node, input_dict):
     axis = node.attrs.get("axes")
+    if isinstance(axis, list) and len(axis) > 1:
+        raise NotImplementedError('reduce_l1 with axis length>1 is not implemented')
     keepdims = node.attrs.get("keepdims", 1)
+    if keepdims == 1:
+      keepdims = True
+    else:
+      keepdims = False
     tensor = input_dict[node.inputs[0]]
-    return [Lambda(lambda x: K.sum(x, axis=axis, keepdims=keepdims))(tensor)]
-
-  @classmethod
-  def handle_reduce_l2(cls, node, input_dict):
-    axis = node.attrs.get("axes")
-    keepdims = node.attrs.get("keepdims", 1)
-    tensor = input_dict[node.inputs[0]]
-    return [Lambda(lambda x: K.std(x, axis=axis, keepdims=keepdims))(tensor)]
+    return [Lambda(lambda x: K.sum(K.abs(x), axis=axis, keepdims=keepdims))(tensor)]
 
   @classmethod
   def handle_reshape(cls, node, input_dict):
@@ -785,31 +802,82 @@ class KerasBackend(Backend):
     return [keras.layers.core.Reshape(shape)(tensor)]
 
   @classmethod
-  def handle_rnn(cls, ):
-    return None
+  def handle_rnn(cls, node, input_dict):
+    hidden_size = node.attrs["hidden_size"]
+    direction = node.attrs['direction']
+    go_backwards = False
+    if direction == 'bidirectional':
+      raise NotImplementedError('bidirectional rnn is not implemented')
+    elif direction == 'forward':
+      go_backwards = False
+    elif direction == 'reverse':
+      go_backwards = True
+    activation = node.attrs['activations']
+    if isinstance(activation, list):
+      activation = activation[0]
+    output_sequence = node.attrs.get('output_sequence', 0)
+    if output_sequence == 0:
+      return_sequences = False
+    else:
+      return_sequences = True
+    x = input_dict[node.inputs[0]]
+    # num_direction=1
+    W = input_dict[node.inputs[1]][0]
+    R = input_dict[node.inputs[2]][0]
+    if len(node.inputs) == 4:
+      B = input_dict[node.inputs[3]][0]
+      rnn = keras.layers.recurrent.SimpleRNN(units=hidden_size, activation=activation, use_bias=True,
+                                             go_backwards=go_backwards, return_sequences=return_sequences,
+                                             weights=[W,R,B])(x)
+    elif len(node.inputs) == 3:
+      rnn = keras.layers.recurrent.SimpleRNN(units=hidden_size, activation=activation, use_bias=False,
+                                             go_backwards=go_backwards, return_sequences=return_sequences,
+                                             weights=[W, R])(x)
+    else:
+      raise NotImplementedError
+
+    if return_sequences:
+      # onnx[seq_length, num_directions, batch_size, hidden_size] keras:[samples,timesteps,output_dim]
+      res = Lambda(lambda _x: K.expand_dims(K.permute_dimensions(_x, [1,0,2]),axis=1))(rnn)
+    else:
+      # onnx[num_directions, batch_size, hidden_size] keras[samples,output_dim]
+      res = Lambda(lambda _x: K.expand_dims(_x, axis=0))(rnn)
+    return [res]
 
   @classmethod
   def handle_selu(cls, node, input_dict):
-    # warnings.warn("Definition of Selu is different "
-    #               "between onnx and tensorflow.", UserWarning)
     return [keras.layers.Activation(activation='selu')(input_dict[node.inputs[0]])]
-
 
   @classmethod
   def handle_shape(cls, node, input_dict):
     return [Lambda(lambda x: K.constant(K.shape(x), dtype='int64'))(input_dict[node.inputs[0]])]
 
+  @classmethod
+  def handle_log_softmax(cls, node, input_dict):
+      x = cls.handle_softmax(node, input_dict)[0]
+      return [Lambda(lambda a: K.log(a))(x)]
 
   @classmethod
   def handle_softmax(cls, node, input_dict):
-    # if "axis" in node.attrs:
-    #   axis = node.attrs["axis"]
-    #   axis = (axis if axis > 0
-    #           else len(input_dict[node.inputs[0]].get_shape()) + axis)
-    # else:
-    #   axis = 1
-    #todo axis attr
-    return [Lambda(lambda x: K.softmax(x))(input_dict[node.inputs[0]])]
+    x = input_dict[node.inputs[0]]
+    shape = K.int_shape(x)
+    if "axis" in node.attrs \
+            and (node.attrs['axis'] == -1 or node.attrs["axis"] == len(shape) - 1):
+        return [Lambda(lambda a: K.softmax(a))(x)]
+    if "axis" in node.attrs:
+        axis = node.attrs["axis"]
+        axis = (axis if axis >= 0 else
+                len(shape) + axis)
+    else:
+        axis = 1
+    if axis == 1:
+        cal_shape = [np.prod(shape[1:])]
+    else:
+        cal_shape = (np.prod(shape[1:axis], np.prod(shape[axis:])))
+    x = keras.layers.Reshape(cal_shape)(x)
+    x = Lambda(lambda _x: K.softmax(_x))(x)
+    x = keras.layers.Reshape(shape[1:])(x)
+    return [x]
 
   @classmethod
   def handle_sub(cls, node, input_dict):
@@ -825,15 +893,6 @@ class KerasBackend(Backend):
     return [Lambda(lambda x, y: K.dot(x,y))(input_dict[node.inputs[0]],
                       input_dict[node.inputs[1]])]
 
-  @classmethod
-  def supports_device(cls, device):
-    if device == "CUDA":
-      local_device_protos = device_lib.list_local_devices()
-      return len([x.name for x in
-                  local_device_protos if x.device_type == 'GPU']) > 0
-    elif device == "CPU":
-      return True
-    return False
 
 prepare = KerasBackend.prepare
 
