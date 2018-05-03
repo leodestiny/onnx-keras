@@ -15,15 +15,13 @@ import itertools
 from math import ceil, floor
 
 try:
-  from itertools import izip as zip
+    from itertools import izip as zip
 except ImportError: # will be 3.x series
-  pass
+    pass
 
 import numpy as np
-from onnx import checker
+from onnx import checker,onnx_pb2, helper
 from onnx.onnx_pb2 import GraphProto, TensorProto, AttributeProto
-from keras_net import KerasNet
-# from onnx_tf.backend_rep import TensorflowRep
 import onnx.numpy_helper
 import onnx.defs
 from keras.models import Model, Sequential
@@ -40,77 +38,98 @@ from onnx.backend.base import (
     namedtupledict,
 )
 
-from onnx import onnx_pb2, helper
 
 def convertAttributeProto(onnx_arg):
+    """
+    Convert an ONNX AttributeProto into an appropriate Python object
+    for the type.
+    NB: Tensor attribute gets returned as the straight proto.
+    """
+    if onnx_arg.HasField('f'):
+        return onnx_arg.f
+    elif onnx_arg.HasField('i'):
+        return onnx_arg.i
+    elif onnx_arg.HasField('s'):
+        return str(onnx_arg.s, 'utf-8') \
+            if sys.version_info[0] >= 3 else onnx_arg.s
+    elif onnx_arg.HasField('t'):
+        return onnx_arg.t  # this is a proto!
+    elif onnx_arg.floats:
+        return list(onnx_arg.floats)
+    elif onnx_arg.ints:
+        return list(onnx_arg.ints)
+    elif onnx_arg.strings:
+        str_list = list(onnx_arg.strings)
+        if sys.version_info[0] >= 3:
+            str_list = map(lambda x: str(x, 'utf-8'), str_list)
+        return str_list
+    else:
+        raise ValueError("Unsupported ONNX attribute: {}".format(onnx_arg))
+
+
+class KerasNet(object):
   """
-  Convert an ONNX AttributeProto into an appropriate Python object
-  for the type.
-  NB: Tensor attribute gets returned as the straight proto.
+    Placeholder class for a protobuf definition.
   """
-  if onnx_arg.HasField('f'):
-    return onnx_arg.f
-  elif onnx_arg.HasField('i'):
-    return onnx_arg.i
-  elif onnx_arg.HasField('s'):
-    return str(onnx_arg.s, 'utf-8') \
-      if sys.version_info[0] >= 3 else onnx_arg.s
-  elif onnx_arg.HasField('t'):
-    return onnx_arg.t  # this is a proto!
-  elif onnx_arg.floats:
-    return list(onnx_arg.floats)
-  elif onnx_arg.ints:
-    return list(onnx_arg.ints)
-  elif onnx_arg.strings:
-    str_list = list(onnx_arg.strings)
-    if sys.version_info[0] >= 3:
-      str_list = map(lambda x: str(x, 'utf-8'), str_list)
-    return str_list
-  else:
-    raise ValueError("Unsupported ONNX attribute: {}".format(onnx_arg))
+  def __init__(self):
+    self.op = []
+    self.external_input = []
+    self.external_output = []
+    self.output = []
+
+    self.output_dict = {}
+
 
 class OnnxAttributes(dict):
-  """
-  This is a more convenient way to work with ONNX/Caffe2 attributes
-  that is not the protobuf representation.
-  """
-  @staticmethod
-  def from_onnx(args):
-    d = OnnxAttributes()
-    for arg in args:
-      d[arg.name] = convertAttributeProto(arg)
-    return d
+    """
+    This is a more convenient way to work with ONNX/Caffe2 attributes
+    that is not the protobuf representation.
+    """
+    @staticmethod
+    def from_onnx(args):
+        d = OnnxAttributes()
+        for arg in args:
+            d[arg.name] = convertAttributeProto(arg)
+        return d
+
 
 class OnnxNode(object):
-  """
-  Reimplementation of NodeProto from ONNX, but in a form
-  more convenient to work with from Python.
-  We may temporarily edit these nodes to get them into Caffe2 form,
-  before actually translating into the Caffe2 protobuf, since this
-  is easier than decomposing everything, and putting it back together
-  when we're ready.
-  """
-  def __init__(self, node):
-    self.name = str(node.name)
-    self.op_type = str(node.op_type)
-    self.attrs = OnnxAttributes.from_onnx(node.attribute)
-    self.consumed_inputs = self.attrs.pop("consumed_inputs", None)
-    self.inputs = list(node.input)
-    self.outputs = list(node.output)
-    self.node_proto = node
+    """
+    Reimplementation of NodeProto from ONNX, but in a form
+    more convenient to work with from Python.
+    We may temporarily edit these nodes to get them into Caffe2 form,
+    before actually translating into the Caffe2 protobuf, since this
+    is easier than decomposing everything, and putting it back together
+    when we're ready.
+    """
+    def __init__(self, node):
+        # print('---------------node intro----------')
+        # print(type(node))
+        # print(node)
+        # print('--------------node end-------------')
+        self.name = str(node.name)
+        self.op_type = str(node.op_type)
+        self.attrs = OnnxAttributes.from_onnx(node.attribute)
+        self.consumed_inputs = self.attrs.pop("consumed_inputs", None)
+        self.inputs = list(node.input)
+        self.outputs = list(node.output)
+        self.node_proto = node
+
 
 class KerasBackend(Backend):
   """ Tensorflow Backend for ONNX
   """
   extra_input = list()
+  extra_input_array = list()
 
   onnx_tf_attribute_map = {
-      "scale": "stddev",
-      "high": "maxval",
-      "low": "minval",
-      "axes": "axis",
-      "axis": "dim",
-      "to": "dtype",
+        "scale": "stddev",
+        "high": "maxval",
+        "low": "minval",
+        "axes": "axis",
+        # "keepdims": "keep_dims",
+        "axis": "dim",
+        "to": "dtype",
   }
 
   onnx_keras_op_map = {
@@ -178,6 +197,8 @@ class KerasBackend(Backend):
 
   @classmethod
   def get_keras_pad(cls, x, pads, dim, data_format=None):
+    if sum(pads) == 0:
+      return x
     if len(pads) == dim*2:
       pads = list(np.transpose(np.array(pads).reshape([2, dim]).astype(np.int32)))
       pads = tuple(tuple(i) for i in pads)
@@ -207,9 +228,10 @@ class KerasBackend(Backend):
   def _bin_op(cls, node, input_dict, op_func, inputlist=True):
     x = input_dict[node.inputs[0]]
     y = input_dict[node.inputs[1]]
-    tmp = np.array([0])
-
-    if type(y) == type(tmp):
+    print(K.int_shape(x))
+    print(K.shape(x).shape, type(K.shape(x)))
+    if isinstance(y, np.ndarray):
+        cls.extra_input_array.append(y)
         y = keras.layers.Input(shape=y.shape)
         cls.extra_input.append(y)
     broadcast = node.attrs.get("broadcast", 1)
@@ -261,7 +283,7 @@ class KerasBackend(Backend):
 
       shape = list(d.dim_value for d in
                    value_info.type.tensor_type.shape.dim)
-      x = Input(batch_shape=shape, name=value_info.name, dtype=
+      x = Input(shape=shape[1:],  name=value_info.name, dtype=
       cls.tensor_type_enum[value_info.type.tensor_type.elem_type])
 
       input_dict_items.append([value_info.name, x])
@@ -311,7 +333,10 @@ class KerasBackend(Backend):
 
     res_model = Model(inputs=inputs+cls.extra_input,
                       outputs=outputs)
+
     print(res_model.layers)
+    return res_model
+    # return TensorflowRep(predict_net, original_input_dict, uninitialized)
 
   @classmethod
   def onnx_initializer_to_input_dict_items(cls,
@@ -357,8 +382,8 @@ class KerasBackend(Backend):
     for i in uninit:
         input_array.append(inputs[i])
         shape = list(inputs[i].shape)
-        if len(shape) == 1:
-            shape = [None, shape[0]]
+        # if len(shape) == 1:
+        #     shape = [-1, shape[0]]
 
         x = Input(batch_shape=shape, name=node.inputs[i], dtype=str(inputs[i].dtype))
         input_tensor.append(x)
@@ -368,9 +393,15 @@ class KerasBackend(Backend):
     model = Model(inputs=input_tensor, outputs=out)
     if len(input_array) == 1:
         input_array = input_array[0]
-
     res = model.predict(input_array)
     return namedtupledict('Outputs', node.outputs)(*[res])
+
+  @classmethod
+  def run_model(cls, model, inputs):
+    keras_model = cls.prepare(model)
+    inputs += cls.extra_input_array
+    res = keras_model.predict(inputs)
+    return res
 
   @classmethod
   def handle_trivial(cls, node, input_dict):
@@ -383,25 +414,14 @@ class KerasBackend(Backend):
     # attribute names.
     attr_map = dict([(x, x) for x in node.attrs.keys()])
 
-    # Modify the map accoridng to onnx_tf_attribute_map.
+    # Modify the map accoridng to onnx_keras_attribute_map.
     attr_map = dict([(x, cls.onnx_tf_attribute_map[x] \
       if x in cls.onnx_tf_attribute_map.keys() else x) \
       for x in attr_map.keys()])
 
-    # TODO: Per op attribute name mapping has the final say.
-
     # Substitute attribute names in attrs.
     attrs = dict([(attr_map[x], y) for (x, y) in attrs.items()])
 
-    if 'axis' in attrs.keys():
-        axis = attrs['axis']
-        if isinstance(axis, list):
-            print(attrs['axis'])
-            # axis = np.array(axis).astype('int32')
-            axis = [int(v) for v in axis]
-            attrs['axis'] = axis
-            print(attrs['axis'])
-            print(type(attrs['axis'][0]))
     func = cls.onnx_keras_op_map[cls.op_name_to_lower(node.op_type)]
 
     inputs = input_dict[node.inputs[0]]
@@ -449,10 +469,6 @@ class KerasBackend(Backend):
 
     x = input_dict[node.inputs[0]]
     x_rank = len(x.get_shape())
-
-    # support_cuda = cls.supports_device("CUDA")
-    # storage_format, compute_format = cls.get_data_format(x_rank, support_cuda)
-
     kernel_shape = node.attrs["kernel_shape"]
     kernel_shape = tuple(kernel_shape)
     strides = node.attrs["strides"]
@@ -504,10 +520,10 @@ class KerasBackend(Backend):
                     "batch_normalization. This attribute will be ignored.",
                     UserWarning)
 
-    print('bn', K.int_shape(x), scale.shape, bias.shape, mean.shape, variance.shape)
+    # print('bn', K.int_shape(x), scale.shape, bias.shape, mean.shape, variance.shape)
     return [keras.layers.BatchNormalization(axis=1, momentum=momentum, epsilon=epsilon,
                                             weights=[scale, bias, mean, variance])(x)]
-                                            # weights=[bias, variance, mean, scale])(x)]
+
   @classmethod
   def handle_clip(cls, node, input_dict):
     assert "max" in node.attrs.keys()
@@ -750,8 +766,17 @@ class KerasBackend(Backend):
     pads = node.attrs["pads"]
 
     x = input_dict[node.inputs[0]]
-
-    return [cls.get_keras_pad(x, pads, num_dim)]
+    print(K.int_shape(x))
+    x = Lambda(lambda a: K.expand_dims(K.expand_dims(a, 0), 0))(x)
+    # x = Lambda(lambda a: K.reshape(a, [1,1]+list(K.int_shape(x))))(x)
+    print(K.int_shape(x))
+    x = cls.get_keras_pad(x, pads, num_dim, 'channels_first')
+    print(K.int_shape(x))
+    x = Lambda(lambda a: K.squeeze(K.squeeze(a, 0), 0))(x)
+    # x = Lambda(lambda a: K.reshape(a, list(K.int_shape(x))[2:]))(x)
+    print(K.int_shape(x))
+    # x = keras.layers.Reshape(list(K.int_shape(x))[2:])(x)
+    return [x]
 
   @classmethod
   def handle_reciprocal(cls, node, input_dict):
@@ -823,20 +848,36 @@ class KerasBackend(Backend):
   def handle_selu(cls, node, input_dict):
     return [keras.layers.Activation(activation='selu')(input_dict[node.inputs[0]])]
 
-
   @classmethod
   def handle_shape(cls, node, input_dict):
     return [Lambda(lambda x: K.constant(K.shape(x), dtype='int64'))(input_dict[node.inputs[0]])]
 
+  @classmethod
+  def handle_log_softmax(cls, node, input_dict):
+      x = cls.handle_softmax(node, input_dict)[0]
+      return [Lambda(lambda a: K.log(a))(x)]
 
   @classmethod
   def handle_softmax(cls, node, input_dict):
-    if 'axis' in node.attrs:
-        warnings.warn("Unsupported axis attribute by Keras in "
-                      "softmax operator. The attribute will be ignored.",
-                      UserWarning)
-    #todo axis attr
-    return [Lambda(lambda x: K.softmax(x))(input_dict[node.inputs[0]])]
+    x = input_dict[node.inputs[0]]
+    shape = K.int_shape(x)
+    if "axis" in node.attrs \
+            and (node.attrs['axis'] == -1 or node.attrs["axis"] == len(shape) - 1):
+        return [Lambda(lambda a: K.softmax(a))(x)]
+    if "axis" in node.attrs:
+        axis = node.attrs["axis"]
+        axis = (axis if axis >= 0 else
+                len(shape) + axis)
+    else:
+        axis = 1
+    if axis == 1:
+        cal_shape = [np.prod(shape[1:])]
+    else:
+        cal_shape = (np.prod(shape[1:axis], np.prod(shape[axis:])))
+    x = keras.layers.Reshape(cal_shape)(x)
+    x = Lambda(lambda _x: K.softmax(_x))(x)
+    x = keras.layers.Reshape(shape[1:])(x)
+    return [x]
 
   @classmethod
   def handle_sub(cls, node, input_dict):
