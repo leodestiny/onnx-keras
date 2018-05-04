@@ -228,12 +228,14 @@ class KerasBackend(Backend):
   def _bin_op(cls, node, input_dict, op_func, inputlist=True):
     x = input_dict[node.inputs[0]]
     y = input_dict[node.inputs[1]]
-    print(K.int_shape(x))
-    print(K.shape(x).shape, type(K.shape(x)))
+
     if isinstance(y, np.ndarray):
-        cls.extra_input_array.append(y)
-        y = keras.layers.Input(shape=y.shape)
+        # tmp = np.reshape(y, [1]+list(y.shape))
+        tmp = np.tile(y,[32]+[1]*len(y.shape))
+        cls.extra_input_array.append(tmp)
+        y = keras.layers.Input(shape=tmp.shape[1:])
         cls.extra_input.append(y)
+
     broadcast = node.attrs.get("broadcast", 1)
     if broadcast == 0:
       warnings.warn("Definition of {} with broadcast disabled is not "
@@ -247,7 +249,6 @@ class KerasBackend(Backend):
         ones = np.ones([num_ones_to_append], 'int32')
         broadcasted_shape = np.concatenate([K.int_shape(y)[1:], ones], axis=0)
         y = keras.layers.Reshape(broadcasted_shape)(y)
-
     if inputlist:
       return op_func([x, y])
     else:
@@ -302,11 +303,7 @@ class KerasBackend(Backend):
     original_input_dict = dict(input_dict_items)
     output_dict = dict()
 
-    cnt = 0
-
     for node in graph_def.node:
-      cnt += 1
-      print(cnt)
       node = OnnxNode(node)
 
       output_ops = cls._onnx_node_to_keras_op(node, input_dict)
@@ -369,7 +366,6 @@ class KerasBackend(Backend):
     if handler_name in dir(cls):
       method_to_call = getattr(cls, handler_name)
       tmp = method_to_call(node, input_dict)
-      # print('check', K.is_keras_tensor(tmp[0]), tmp[0])
       return tmp
     else:
       raise NotImplementedError("{} op is not implemented.".format(node.op_type))
@@ -381,6 +377,8 @@ class KerasBackend(Backend):
     input_tensor = list()
     input_array = list()
     input_dict = dict()
+    cls.extra_input = list()
+    cls.extra_input_array = list()
     for i in range(len(inputs)):
         input_dict[node.inputs[i]] = inputs[i]
     for i in uninit:
@@ -389,12 +387,13 @@ class KerasBackend(Backend):
         # if len(shape) == 1:
         #     shape = [-1, shape[0]]
 
-        x = Input(batch_shape=shape, name=node.inputs[i], dtype=str(inputs[i].dtype))
+        x = Input(shape=shape[1:], name=node.inputs[i], dtype=str(inputs[i].dtype))
         input_tensor.append(x)
         input_dict[node.inputs[i]] = x
     out = cls._onnx_node_to_keras_op(node, input_dict)[0]
 
-    model = Model(inputs=input_tensor, outputs=out)
+    model = Model(inputs=input_tensor+cls.extra_input, outputs=out)
+    input_array += cls.extra_input_array
     if len(input_array) == 1:
         input_array = input_array[0]
     res = model.predict(input_array)
@@ -426,6 +425,15 @@ class KerasBackend(Backend):
     # Substitute attribute names in attrs.
     attrs = dict([(attr_map[x], y) for (x, y) in attrs.items()])
 
+    if 'axis' in attrs.keys():
+        axis = attrs['axis']
+        if isinstance(axis, list):
+            print(attrs['axis'])
+            # axis = np.array(axis).astype('int32')
+            axis = [int(v) for v in axis]
+            attrs['axis'] = axis
+            print(attrs['axis'])
+            print(type(attrs['axis'][0]))
     func = cls.onnx_keras_op_map[cls.op_name_to_lower(node.op_type)]
 
     inputs = input_dict[node.inputs[0]]
@@ -524,7 +532,6 @@ class KerasBackend(Backend):
                     "batch_normalization. This attribute will be ignored.",
                     UserWarning)
 
-    # print('bn', K.int_shape(x), scale.shape, bias.shape, mean.shape, variance.shape)
     return [keras.layers.BatchNormalization(axis=1, momentum=momentum, epsilon=epsilon,
                                             weights=[scale, bias, mean, variance])(x)]
 
@@ -557,7 +564,6 @@ class KerasBackend(Backend):
     data_format = 'channels_first'
 
     W_weights = input_dict[node.inputs[1]]
-
     filters = len(W_weights)
     W_weights = np.transpose(W_weights, [2, 3, 1, 0])
     dilations = node.attrs.get("dilations", [1]*dim)
