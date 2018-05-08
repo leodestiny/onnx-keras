@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 from backend import run_node
 from onnx import helper
-from onnx.onnx_pb2 import TensorProto
+# from onnx.onnx_pb2 import TensorProto
 import skimage.measure as sm
 
 class TestNode(unittest.TestCase):
@@ -32,6 +32,16 @@ class TestNode(unittest.TestCase):
     if x < 0.:
       return alpha * x
     return x
+
+  def _logsoftmax_2d(self, x):
+    max_x = np.max(x, axis=1).reshape((-1, 1))
+    exp_x = np.exp(x - max_x)
+    return x - max_x - np.log(np.sum(exp_x, axis=1).reshape((-1, 1)))
+
+  def _softmax_2d(self, x):
+    max_x = np.max(x, axis=1).reshape((-1, 1))
+    exp_x = np.exp(x - max_x)
+    return exp_x / np.sum(exp_x, axis=1).reshape((-1, 1))
 
   def test_abs(self):
     node_def = helper.make_node("Abs", ["X"], ["Y"])
@@ -197,6 +207,17 @@ class TestNode(unittest.TestCase):
 
     np.testing.assert_almost_equal(output["Y"], test_output, decimal=5)
 
+  def test_depth_to_space(self):
+    b,c,h,w = shape = (2,8,3,3)
+    blocksize = 2
+    node_def = helper.make_node("DepthToSpace", ["X"], ["Y"], blocksize=blocksize)
+    x = self._get_rnd(shape)
+    tmp = np.reshape(x, [b, blocksize, blocksize, c // (blocksize ** 2), h, w])
+    tmp = np.transpose(tmp, [0, 3, 4, 1, 5, 2])
+    test_output = np.reshape(tmp, [b, c // (blocksize ** 2), h * blocksize, w * blocksize])
+    output = run_node(node_def, [x])
+    np.testing.assert_almost_equal(output["Y"], test_output)
+
   def test_elu(self):
     node_def = helper.make_node("Elu", ["X"], ["Y"])
     x = self._get_rnd([10, 10])
@@ -314,6 +335,13 @@ class TestNode(unittest.TestCase):
         test_output[i1][i2][0][0] = max
     np.testing.assert_almost_equal(output["Y"], test_output)
 
+  def test_hard_sigmoid(self):
+    node_def = helper.make_node("HardSigmoid", ["X"], ["Y"], alpha=0.5, beta=0.6)
+    x = self._get_rnd((10,5,3))
+    test_output = np.clip(x*0.5+0.6, 0, 1)
+    output = run_node(node_def, [x])
+    np.testing.assert_almost_equal(output["Y"], test_output)
+
   def test_leakyrelu(self):
     node_def = helper.make_node("LeakyRelu", ["X"], ["Y"], alpha=2.0)
     x = self._get_rnd([10, 10])
@@ -322,21 +350,38 @@ class TestNode(unittest.TestCase):
     np.testing.assert_almost_equal(output["Y"], test_output)
 
   def test_log(self):
-      node_def = helper.make_node("Log", ["X"], ["Y"])
-      x = self._get_rnd([10,10])
-      x = x + 3.6
-      output = run_node(node_def, [x])
-      np.testing.assert_almost_equal(output["Y"], np.log(x))
+    node_def = helper.make_node("Log", ["X"], ["Y"])
+    x = self._get_rnd([10,10])
+    x = x + 3.6
+    output = run_node(node_def, [x])
+    np.testing.assert_almost_equal(output["Y"], np.log(x))
+
+  def test_log_softmax(self):
+    node_def = helper.make_node("LogSoftmax", ["X"], ["Y"], axis=1)
+    x = np.abs(self._get_rnd((3,4,5)))
+    test_output = self._logsoftmax_2d(x.reshape(3,20)).reshape(3,4,5)
+    output = run_node(node_def, [x])
+    np.testing.assert_almost_equal(output["Y"], test_output, decimal=6)
 
   def test_max(self):
-      node_def = helper.make_node("Max", ["X1", "X2", "X3", "X4"], ["Z"])
-      x1 = self._get_rnd([10, 10])
-      x2 = self._get_rnd([10, 10])
-      x3 = self._get_rnd([10, 10])
-      x4 = self._get_rnd([10, 10])
-      output = run_node(node_def, [x1, x2, x3, x4], [0,1,2,3])
-      test_output = np.maximum(np.maximum(np.maximum(x1, x2), x3), x4)
-      np.testing.assert_almost_equal(output["Z"], test_output)
+    node_def = helper.make_node("Max", ["X1", "X2", "X3", "X4"], ["Z"])
+    x1 = self._get_rnd([10, 10])
+    x2 = self._get_rnd([10, 10])
+    x3 = self._get_rnd([10, 10])
+    x4 = self._get_rnd([10, 10])
+    output = run_node(node_def, [x1, x2, x3, x4], [0,1,2,3])
+    test_output = np.maximum(np.maximum(np.maximum(x1, x2), x3), x4)
+    np.testing.assert_almost_equal(output["Z"], test_output)
+
+  def test_mat_mul(self):
+    return
+    node_def = helper.make_node("MatMul", ["X1", "X2"], ["Z"])
+    x1 = self._get_rnd([10, 20])
+    x2 = self._get_rnd([20, 15])
+    test_output = np.matmul(x1,x2)
+    print(test_output.shape)
+    output = run_node(node_def, [x1,x2], [0,1])
+    np.testing.assert_almost_equal(output["Z"], test_output)
 
   def test_max_pool(self):
     node_def = helper.make_node(
@@ -388,60 +433,75 @@ class TestNode(unittest.TestCase):
   def test_reciprocal(self):
     node_def = helper.make_node("Reciprocal", ["X"], ["Y"])
     x = self._get_rnd([10,10])
-
     output = run_node(node_def, [x])
     np.testing.assert_almost_equal(output["Y"], 1.0 / x)
 
   def test_reduce_l1(self):
-    node_def = helper.make_node("ReduceL1", ["X"], ["Y"], axes=[1])
+    node_def = helper.make_node("ReduceL1", ["X"], ["Y"], axes=[2])
     x = self._get_rnd([1, 10, 10, 3])
     output = run_node(node_def, [x])
     np.testing.assert_almost_equal(output["Y"],
-                                   np.linalg.norm(x, 1, (1), True))
+                                   np.linalg.norm(x, 1, 2, True))
 
-  # def test_reduce_log_sum_exp(self):
-  #   node_def = helper.make_node("ReduceLogSumExp", ["X"], ["Y"], axes=[1, 2])
-  #   x = self._get_rnd([5, 10, 10, 3])
-  #   output = run_node(node_def, [x])
-  #   np.testing.assert_allclose(
-  #       output["Y"],
-  #       np.log(np.sum(np.exp(x), axis=(1, 2), keepdims=True)),
-  #       rtol=1e-3)
-  #
-  # def test_reduce_max(self):
-  #   node_def = helper.make_node("ReduceMax", ["X"], ["Y"], axes=[1])
-  #   x = self._get_rnd([5, 10, 10, 3])
-  #   output = run_node(node_def, [x])
-  #   np.testing.assert_allclose(
-  #       output["Y"], np.max(x, (1, 2), keepdims=True), rtol=1e-3)
-  #
-  # def test_reduce_mean(self):
-  #   node_def = helper.make_node("ReduceMean", ["X"], ["Y"], axes=[1, 2])
-  #   x = self._get_rnd([5, 10, 10, 3])
-  #   output = run_node(node_def, [x])
-  #   np.testing.assert_allclose(
-  #       output["Y"], np.mean(x, (1, 2), keepdims=True), rtol=1e-3)
-  #
-  # def test_reduce_min(self):
-  #   node_def = helper.make_node("ReduceMin", ["X"], ["Y"], axes=[1, 2])
-  #   x = self._get_rnd([5, 10, 10, 3])
-  #   output = run_node(node_def, [x])
-  #   np.testing.assert_allclose(
-  #       output["Y"], np.min(x, (1, 2), keepdims=True), rtol=1e-3)
-  #
-  # def test_reduce_prod(self):
-  #   node_def = helper.make_node("ReduceProd", ["X"], ["Y"], axes=[1, 2])
-  #   x = self._get_rnd([1, 5, 5, 3])
-  #   output = run_node(node_def, [x])
-  #   np.testing.assert_allclose(
-  #       output["Y"], np.prod(x, (1, 2), keepdims=True), rtol=1e-3)
+  def test_reduce_log_sum(self):
+    node_def = helper.make_node("ReduceLogSum", ["X"], ["Y"], axes=[1, 2])
+    x = np.abs(self._get_rnd([5, 10, 10, 3]))
+    output = run_node(node_def, [x])
+    np.testing.assert_allclose(
+        output["Y"],
+        np.log(np.sum(x, axis=(1, 2), keepdims=True)),
+        rtol=1e-3)
 
-  # def test_reduce_sum(self):
-  #   node_def = helper.make_node("ReduceSum", ["X"], ["Y"], axes=[1, 2])
-  #   x = self._get_rnd([5, 10, 10, 3])
-  #   output = run_node(node_def, [x])
-  #   np.testing.assert_allclose(
-  #       output["Y"], np.sum(x, (1, 2), keepdims=True), rtol=1e-3)
+  def test_reduce_log_sum_exp(self):
+    node_def = helper.make_node("ReduceLogSumExp", ["X"], ["Y"], axes=[1, 2])
+    x = self._get_rnd([5, 10, 10, 3])
+    output = run_node(node_def, [x])
+    np.testing.assert_allclose(
+        output["Y"],
+        np.log(np.sum(np.exp(x), axis=(1, 2), keepdims=True)),
+        rtol=1e-3)
+
+  def test_reduce_max(self):
+    node_def = helper.make_node("ReduceMax", ["X"], ["Y"], axes=[1,3])
+    x = self._get_rnd([5, 10, 10, 3])
+    output = run_node(node_def, [x])
+    np.testing.assert_allclose(
+        output["Y"], np.max(x, (1, 3), keepdims=True), rtol=1e-3)
+
+  def test_reduce_mean(self):
+    node_def = helper.make_node("ReduceMean", ["X"], ["Y"], axes=[1, 2])
+    x = self._get_rnd([5, 10, 10, 3])
+    output = run_node(node_def, [x])
+    np.testing.assert_allclose(
+        output["Y"], np.mean(x, (1, 2), keepdims=True), rtol=1e-3)
+
+  def test_reduce_min(self):
+    node_def = helper.make_node("ReduceMin", ["X"], ["Y"], axes=[1, 2])
+    x = self._get_rnd([5, 10, 10, 3])
+    output = run_node(node_def, [x])
+    np.testing.assert_allclose(
+        output["Y"], np.min(x, (1, 2), keepdims=True), rtol=1e-3)
+
+  def test_reduce_prod(self):
+    node_def = helper.make_node("ReduceProd", ["X"], ["Y"], axes=[1, 2])
+    x = self._get_rnd([1, 5, 5, 3])
+    output = run_node(node_def, [x])
+    np.testing.assert_allclose(
+        output["Y"], np.prod(x, (1, 2), keepdims=True), rtol=1e-3)
+
+  def test_reduce_sum(self):
+    node_def = helper.make_node("ReduceSum", ["X"], ["Y"], axes=[1,2])
+    x = self._get_rnd([5, 10, 10, 3])
+    output = run_node(node_def, [x])
+    np.testing.assert_allclose(
+        output["Y"], np.sum(x, (1, 2), keepdims=True), rtol=1e-3)
+
+  def test_reduce_sum_square(self):
+    node_def = helper.make_node("ReduceSumSquare", ["X"], ["Y"], axes=[1,2])
+    x = self._get_rnd([5, 10, 10, 3])
+    output = run_node(node_def, [x])
+    np.testing.assert_allclose(
+        output["Y"], np.sum(np.square(x), (1, 2), keepdims=True), rtol=1e-3)
 
   def test_relu(self):
     node_def = helper.make_node("Relu", ["X"], ["Y"])
@@ -449,11 +509,52 @@ class TestNode(unittest.TestCase):
     output = run_node(node_def, [x])
     np.testing.assert_almost_equal(output["Y"], np.maximum(x, 0))
 
+  def test_reshape(self):
+    node_def = helper.make_node("Reshape", ["X"], ["Y"], shape=[10,4,5])
+    x = self._get_rnd([10,20])
+    output = run_node(node_def, [x], [0])
+    np.testing.assert_almost_equal(output["Y"], x.reshape(10,4,5))
+
   def test_sigmoid(self):
     node_def = helper.make_node("Sigmoid", ["X"], ["Y"])
     x = self._get_rnd([10,10])
     output = run_node(node_def, [x])
     np.testing.assert_almost_equal(output["Y"], 1 / (1 + np.exp(-x)))
+
+  def test_softmax(self):
+    node_def = helper.make_node("Softmax", ["X"], ["Y"])
+    x = self._get_rnd((3, 20))
+    test_output = self._softmax_2d(x)
+    output = run_node(node_def, [x])
+    np.testing.assert_almost_equal(output["Y"], test_output, decimal=6)
+
+  def test_softplus(self):
+    node_def = helper.make_node("Softplus", ["X"], ["Y"])
+    x = self._get_rnd([3, 4, 5])
+    output = run_node(node_def, [x])
+    np.testing.assert_almost_equal(output["Y"], np.log(np.exp(x) + 1))
+
+  def test_softsign(self):
+    node_def = helper.make_node("Softsign", ["X"], ["Y"])
+    x = self._get_rnd([3, 4, 5])
+    output = run_node(node_def, [x])
+    np.testing.assert_almost_equal(output["Y"], x / (1 + np.abs(x)))
+
+  def test_space_to_depth(self):
+    node_def = helper.make_node("SpaceToDepth", ["X"], ["Y"], blocksize=2)
+    x_shape = [1, 3, 10, 10]
+    x = self._get_rnd(x_shape)
+    output = run_node(node_def, [x])
+    y = np.reshape(
+      np.swapaxes(x.reshape(1, 3, 2, 5, 2, 5), 3, 4), (1, 12,5,5))
+    np.testing.assert_allclose(output["Y"], y, rtol=1e-3)
+
+  def test_squeeze(self):
+    node_def = helper.make_node("Squeeze", ["X"], ["Y"], axes=[2,3])
+    x = self._get_rnd([10,5,1,1,30])
+    # x = np.array([[[0], [1], [2]]])
+    output = run_node(node_def, [x])
+    np.testing.assert_almost_equal(output["Y"], np.squeeze(x, axis=(2,3)))
 
   def test_sqrt(self):
     node_def = helper.make_node("Sqrt", ["X"], ["Y"])
@@ -483,6 +584,20 @@ class TestNode(unittest.TestCase):
     x = self._get_rnd([10,10]) + 1.0
     output = run_node(node_def, [x])
     np.testing.assert_almost_equal(output["Y"], np.tanh(x), decimal=5)
+
+  def test_tile(self):
+    return
+    node_def = helper.make_node("Tile", ["X1", "X2"], ["Z"])
+    x = self._get_rnd([3, 5, 5, 3])
+    repeats = [1, 1, 2, 1]
+    output = run_node(node_def, [x, repeats], [0, 1])
+    np.testing.assert_allclose(output["Z"], np.tile(x, repeats), rtol=1e-3)
+
+  def test_transpose(self):
+    node_def = helper.make_node("Transpose", ["X"], ["Y"], perm=[0, 2, 1])
+    x = self._get_rnd([1000]).reshape([10, 10, 10])
+    output = run_node(node_def, [x])
+    np.testing.assert_almost_equal(output["Y"], np.transpose(x, (0, 2, 1)))
 
 if __name__ == '__main__':
   unittest.main()
