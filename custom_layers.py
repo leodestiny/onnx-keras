@@ -1,8 +1,8 @@
-from keras.layers.core import Layer
 from keras import backend as K
-import numpy as np
-from keras.layers.convolutional import _Conv
 from keras.engine import InputSpec
+from keras.layers.convolutional import _Conv
+from keras.layers.core import Layer
+
 
 class LRN(Layer):
     def __init__(self, alpha=0.0001, k=1, beta=0.75, n=5, **kwargs):
@@ -91,7 +91,7 @@ class GroupConv(_Conv):
                     if self.data_format == 'channels_first':
                         output_list.append(self.cal_conv(
                             x[:, size * i:size * (i + 1), :, :],
-                            self.kernel[:, :, :, k_size*i:k_size*(i+1)]
+                            self.kernel[:, :, :, k_size * i:k_size * (i + 1)]
                         ))
 
                     else:
@@ -104,7 +104,6 @@ class GroupConv(_Conv):
             if self.use_bias:
                 outputs = K.bias_add(outputs, self.bias, data_format=self.data_format)
             return outputs
-
 
     def get_config(self):
         config = {"group": self.group}
