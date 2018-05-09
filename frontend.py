@@ -1,7 +1,7 @@
 import numpy as np
 from keras.layers import *
 from onnx.checker import check_model
-from onnx.helper import (make_graph, make_model, make_node, make_tensor, make_tensor_value_info)
+from onnx.helper import (make_graph, make_model, make_node, make_tensor, make_tensor_value_info,make_opsetid)
 from onnx.mapping import NP_TYPE_TO_TENSOR_TYPE
 
 from utils import STR_TO_ONNX_TYPE, convert_shape, rename_operator
@@ -96,9 +96,12 @@ class KerasFrontend(object):
 
         # TODO save domain, model_version,doc_string
 
+        opset = make_opsetid("",6)
+
         model = make_model(cls.keras_graph_to_onnx_graph(model,name=model_name),
                            model_version=model_version,
-                           producer_name=producer_name)
+                           producer_name=producer_name,
+                           opset_imports=[opset])
         check_model(model)
         return model
 
@@ -309,8 +312,6 @@ class KerasFrontend(object):
             weight_list.append(cls.make_weights(B_name, B_weight))
 
             inputs.append(B_name)
-        else:
-            inputs.append("")
 
         # these inputs are not used
         sequence_lens = None
@@ -403,8 +404,6 @@ class KerasFrontend(object):
             weight_list.append(cls.make_weights(B_name, B_weight))
 
             inputs.append(B_name)
-        else:
-            inputs.append("")
 
         # these inputs are not used
         sequence_lens = None
@@ -644,8 +643,6 @@ class KerasFrontend(object):
                                            dims=bias_weight.shape,
                                            vals=bias_weight.flatten().tolist()))
             inputs.append(bias_name)
-        else:
-            inputs.append("")
 
         # get onnx attribute from keras config
         strides = list(config['strides'])
@@ -721,8 +718,6 @@ class KerasFrontend(object):
             graph_input_list.append(cls.make_symbolic_weights(bias_name, bias_weight))
             weight_list.append(cls.make_weights(bias_name, bias_weight))
             inputs.append(bias_name)
-        else:
-            inputs.append("")
 
         # get onnx attribute from keras config
         strides = list(config['strides'])

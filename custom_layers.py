@@ -53,7 +53,7 @@ class GroupConv(_Conv):
             raise ValueError('The channel dimension of the inputs '
                              'should be defined. Found `None`.')
         input_dim = input_shape[channel_axis]
-        kernel_shape = self.kernel_size + (input_dim / self.group, self.filters)
+        kernel_shape = self.kernel_size + (int(input_dim / self.group), self.filters)
 
         self.kernel = self.add_weight(shape=kernel_shape,
                                       initializer=self.kernel_initializer,
