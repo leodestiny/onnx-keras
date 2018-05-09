@@ -20,8 +20,8 @@ except ImportError: # will be 3.x series
     pass
 
 import numpy as np
-from onnx import checker,onnx_pb2, helper
-from onnx.onnx_pb2 import GraphProto, TensorProto, AttributeProto
+from onnx import checker, helper
+# from onnx.onnx_pb2 import GraphProto, TensorProto, AttributeProto
 import onnx.numpy_helper
 import onnx.defs
 from keras.models import Model, Sequential
@@ -127,48 +127,25 @@ class KerasBackend(Backend):
         "high": "maxval",
         "low": "minval",
         "axes": "axis",
-        # "keepdims": "keep_dims",
+        "keepdims": "keepdims",
         "axis": "dim",
         "to": "dtype",
   }
 
   onnx_keras_op_map = {
       "abs": K.abs,
-      "cast": K.cast,
       "exp": K.exp,
       "hardsigmoid": K.hard_sigmoid,
       "log": K.log,
       "random_normal": K.random_normal,
       "random_uniform": K.random_uniform,
-      "reduce_log_sum_exp": K.logsumexp,
-      "reduce_max": K.max,
-      "reduce_mean": K.mean,
-      "reduce_min": K.min,
-      "reduce_prod": K.prod,
-      "reduce_sum": K.sum,
+
       "relu": K.relu,
       "sigmoid": K.sigmoid,
       "softplus": K.softplus,
       "softsign": K.softsign,
       "sqrt": K.sqrt,
-      "squeeze": K.squeeze,
       "tanh": K.tanh,
-      "transpose": K.transpose,
-  }
-
-  tensor_type_to_keras_type = {
-      TensorProto.FLOAT: 'float32',
-      TensorProto.UINT8: 'uint8',
-      TensorProto.INT8: 'int8',
-      TensorProto.UINT16: 'uint16',
-      TensorProto.INT16: 'int16',
-      TensorProto.INT32: 'int32',
-      TensorProto.INT64: 'int64',
-      TensorProto.BOOL: 'bool',
-      TensorProto.FLOAT16: 'float16',
-      TensorProto.DOUBLE: 'float64',
-      TensorProto.COMPLEX64: 'complex64',
-      TensorProto.COMPLEX128: 'complex128',
   }
 
   tensor_type_enum = [
@@ -190,7 +167,7 @@ class KerasBackend(Backend):
   ]
 
   attr_translator = {
-      "dtype": lambda cls, x: cls.tensor_type_to_keras_type[x],
+      # "dtype": lambda cls, x: cls.tensor_type_to_keras_type[x],
       "keepdims": lambda cls, x: bool(x),
       "to": lambda cls, x: x,
   }
@@ -228,12 +205,15 @@ class KerasBackend(Backend):
   def _bin_op(cls, node, input_dict, op_func, inputlist=True):
     x = input_dict[node.inputs[0]]
     y = input_dict[node.inputs[1]]
-    print(K.int_shape(x))
-    print(K.shape(x).shape, type(K.shape(x)))
+    # print(node.op_type, x.shape, y.shape)
     if isinstance(y, np.ndarray):
-        cls.extra_input_array.append(y)
-        y = keras.layers.Input(shape=y.shape)
+        # print('is numpy')
+        # tmp = np.reshape(y, [1]+list(y.shape))
+        tmp = np.tile(y,[32]+[1]*len(y.shape))
+        cls.extra_input_array.append(tmp)
+        y = keras.layers.Input(shape=tmp.shape[1:])
         cls.extra_input.append(y)
+
     broadcast = node.attrs.get("broadcast", 1)
     if broadcast == 0:
       warnings.warn("Definition of {} with broadcast disabled is not "
@@ -247,12 +227,17 @@ class KerasBackend(Backend):
         ones = np.ones([num_ones_to_append], 'int32')
         broadcasted_shape = np.concatenate([K.int_shape(y)[1:], ones], axis=0)
         y = keras.layers.Reshape(broadcasted_shape)(y)
-
     if inputlist:
       return op_func([x, y])
     else:
       return op_func(x, y)
 
+  @classmethod
+  def _reduce_op(cls, node, input_dict, func):
+    x = input_dict[node.inputs[0]]
+    axis = node.attrs.get('axes', None)
+    keepdims = bool(node.attrs.get('keepdims', 1))
+    return [Lambda(lambda a: func(a, axis, keepdims))(x)]
 
   @classmethod
   def onnx_graph_to_keras_net(cls, graph_def):
@@ -283,7 +268,7 @@ class KerasBackend(Backend):
 
       shape = list(d.dim_value for d in
                    value_info.type.tensor_type.shape.dim)
-      x = Input(shape=shape[1:], dtype=
+      x = Input(batch_shape=shape, dtype=
       cls.tensor_type_enum[value_info.type.tensor_type.elem_type])
 
       input_dict_items.append([value_info.name, x])
@@ -302,11 +287,7 @@ class KerasBackend(Backend):
     original_input_dict = dict(input_dict_items)
     output_dict = dict()
 
-    cnt = 0
-
     for node in graph_def.node:
-      cnt += 1
-      print(cnt)
       node = OnnxNode(node)
 
       output_ops = cls._onnx_node_to_keras_op(node, input_dict)
@@ -369,7 +350,6 @@ class KerasBackend(Backend):
     if handler_name in dir(cls):
       method_to_call = getattr(cls, handler_name)
       tmp = method_to_call(node, input_dict)
-      # print('check', K.is_keras_tensor(tmp[0]), tmp[0])
       return tmp
     else:
       raise NotImplementedError("{} op is not implemented.".format(node.op_type))
@@ -381,6 +361,8 @@ class KerasBackend(Backend):
     input_tensor = list()
     input_array = list()
     input_dict = dict()
+    cls.extra_input = list()
+    cls.extra_input_array = list()
     for i in range(len(inputs)):
         input_dict[node.inputs[i]] = inputs[i]
     for i in uninit:
@@ -394,7 +376,8 @@ class KerasBackend(Backend):
         input_dict[node.inputs[i]] = x
     out = cls._onnx_node_to_keras_op(node, input_dict)[0]
 
-    model = Model(inputs=input_tensor, outputs=out)
+    model = Model(inputs=input_tensor+cls.extra_input, outputs=out)
+    input_array += cls.extra_input_array
     if len(input_array) == 1:
         input_array = input_array[0]
     res = model.predict(input_array)
@@ -413,7 +396,6 @@ class KerasBackend(Backend):
     attrs = dict([(x, cls.attr_translator[x](cls, node.attrs[x]) \
       if x in cls.attr_translator else node.attrs[x]) \
       for x in node.attrs.keys()])
-
     # Create an identity map from onnx attribute names to tf
     # attribute names.
     attr_map = dict([(x, x) for x in node.attrs.keys()])
@@ -429,20 +411,11 @@ class KerasBackend(Backend):
     func = cls.onnx_keras_op_map[cls.op_name_to_lower(node.op_type)]
 
     inputs = input_dict[node.inputs[0]]
-    res = Lambda(lambda a: func(a, *attrs))(inputs)
+    res = Lambda(lambda a: func(a, **attrs))(inputs)
     return [res]
 
   @classmethod
   def handle_add(cls, node, input_dict):
-    x = input_dict[node.inputs[0]]
-    y = input_dict[node.inputs[1]]
-    # tmp = np.array([0])
-    #
-    # if type(y) == type(tmp):
-    #   total_num_dim = len(x.get_shape())
-    #   y = cls._explicit_broadcast(y,0,total_num_dim-1)
-    #   return [Lambda(lambda a: K.bias_add(a, K.constant(y)))(x)]
-
     return [cls._bin_op(node, input_dict, keras.layers.add)]
 
   @classmethod
@@ -524,7 +497,6 @@ class KerasBackend(Backend):
                     "batch_normalization. This attribute will be ignored.",
                     UserWarning)
 
-    # print('bn', K.int_shape(x), scale.shape, bias.shape, mean.shape, variance.shape)
     return [keras.layers.BatchNormalization(axis=1, momentum=momentum, epsilon=epsilon,
                                             weights=[scale, bias, mean, variance])(x)]
 
@@ -542,7 +514,6 @@ class KerasBackend(Backend):
   def handle_concat(cls, node, input_dict):
     values = [input_dict[a] for a in node.inputs]
     axis = node.attrs.get("axis", 1)
-
     return [keras.layers.concatenate(values, axis=axis)]
 
   @classmethod
@@ -557,15 +528,12 @@ class KerasBackend(Backend):
     data_format = 'channels_first'
 
     W_weights = input_dict[node.inputs[1]]
-
     filters = len(W_weights)
     W_weights = np.transpose(W_weights, [2, 3, 1, 0])
     dilations = node.attrs.get("dilations", [1]*dim)
     strides = node.attrs.get("strides", [1]*dim)
     kernel_size = node.attrs.get("kernel_shape")
-    if "group" in node.attrs and node.attrs['group'] != 1:
-      raise NotImplementedError("'group' attribute in conv is not implemented")
-
+    group = node.attrs.get('group', 1)
     padding='valid'
 
     if "auto_pad" in node.attrs.keys():
@@ -576,14 +544,14 @@ class KerasBackend(Backend):
 
     if "pads" in node.attrs.keys():
       x = cls.get_keras_pad(x, node.attrs["pads"], dim, data_format)
-
+    from custom_layers import GroupConv
     if len(node.inputs) == 2:
-      convolved = keras.layers.convolutional._Conv(
+      convolved = GroupConv(group=group,
         rank=dim, filters=filters, kernel_size=kernel_size, data_format=data_format, padding=padding,
         dilation_rate=dilations, strides=strides, use_bias=False, weights=[W_weights])(x)
     else:
       bias = input_dict[node.inputs[2]]
-      convolved = keras.layers.convolutional._Conv(
+      convolved = GroupConv(group=group,
         rank=dim, filters=filters, kernel_size=kernel_size, data_format=data_format, padding=padding,
         dilation_rate=dilations, strides=strides, use_bias=True, weights=[W_weights, bias])(x)
 
@@ -593,6 +561,16 @@ class KerasBackend(Backend):
   @classmethod
   def handle_conv(cls, node, input_dict):
     return cls._conv(node, input_dict)
+
+  @classmethod
+  def handle_depth_to_space(cls, node, input_dict):
+    x = input_dict[node.inputs[0]]
+    block_size = node.attrs['blocksize']
+    b, c, h, w = K.int_shape(x)
+    x = keras.layers.Reshape([block_size, block_size, c//(block_size**2), h, w])(x)
+    x = keras.layers.Permute((3,4,1,5,2))(x)
+    x = keras.layers.Reshape([c // (block_size**2), h * block_size, w * block_size])(x)
+    return [x]
 
   @classmethod
   def handle_dropout(cls, node, input_dict):
@@ -642,23 +620,15 @@ class KerasBackend(Backend):
     return [keras.layers.core.Reshape(output_shape)(tensor)]
 
   @classmethod
-  def handle_gather(cls, node, input_dict):
-      x = input_dict[node.inputs[0]]
-
-      y = input_dict[node.inputs[1]]
-      axis = node.attrs.get(['axis'], 0)
-      if axis != 0:
-          raise NotImplementedError
-      return [Lambda(lambda _x, _y: K.gather(_x, _y))(x, y)]
-
-
-  @classmethod
   def handle_gemm(cls, node, input_dict):
     x = input_dict[node.inputs[0]]
 
     y = input_dict[node.inputs[1]]
 
     z = input_dict[node.inputs[2]]
+    shape = K.int_shape(x)
+    if len(shape) > 2:
+      x = keras.layers.Reshape([np.prod(shape[1:])])(x)
     if "transA" in node.attrs.keys() and node.attrs["transA"] == 1:
       x = K.transpose(x)
     if "transB" in node.attrs.keys() and node.attrs["transB"] == 1:
@@ -706,11 +676,31 @@ class KerasBackend(Backend):
     return [res]
 
   @classmethod
+  def handle_hard_sigmoid(cls, node, input_dict):
+    alpha = node.attrs.get('alpha', 0.2)
+    beta = node.attrs.get('beta', 0.5)
+    return [Lambda(lambda x: K.clip(alpha*x+beta, 0, 1))(input_dict[node.inputs[0]])]
+
+  @classmethod
   def handle_leaky_relu(cls, node, input_dict):
     x = input_dict[node.inputs[0]]
     alpha = node.attrs.get("alpha", 1.0)
     return [Lambda(lambda a: K.relu(a)-alpha*K.relu(-a))(x)]
 
+  @classmethod
+  def handle_l_r_n(cls, node, input_dict):
+    from custom_layers import LRN
+    x = input_dict[node.inputs[0]]
+    alpha = node.attrs["alpha"]
+    beta = node.attrs["beta"]
+    bias = node.attrs["bias"]
+    size = node.attrs["size"]
+    return [LRN(alpha=alpha, beta=beta, k=bias, n=size)(x)]
+
+  @classmethod
+  def handle_mat_mul(cls, node, input_dict):
+    return [Lambda(lambda x: K.dot(x[0], x[1]))([input_dict[node.inputs[0]],
+                                               input_dict[node.inputs[1]]])]
   @classmethod
   def handle_max(cls, node, input_dict):
     values = [input_dict[a] for a in node.inputs]
@@ -753,57 +743,66 @@ class KerasBackend(Backend):
 
 
   @classmethod
-  def handle_pad(cls, node, input_dict):
-    num_dim = int(len(node.attrs["pads"])/2)
-    mode = node.attrs.get("mode", "constant")
-    if mode != "constant":
-        warnings.warn("Unsupported mode:{} attribute by Keras in "
-                      "pad operator. The attribute will be ignored.".format(mode),
-                      UserWarning)
-
-    value = node.attrs.get("value", 0)
-    if value != 0:
-        warnings.warn("Unsupported value:{} attribute by Keras in "
-                      "pad operator. The attribute will be ignored.".format(value),
-                      UserWarning)
-
-    pads = node.attrs["pads"]
-
-    x = input_dict[node.inputs[0]]
-    print(K.int_shape(x))
-    x = Lambda(lambda a: K.expand_dims(K.expand_dims(a, 0), 0))(x)
-    # x = Lambda(lambda a: K.reshape(a, [1,1]+list(K.int_shape(x))))(x)
-    print(K.int_shape(x))
-    x = cls.get_keras_pad(x, pads, num_dim, 'channels_first')
-    print(K.int_shape(x))
-    x = Lambda(lambda a: K.squeeze(K.squeeze(a, 0), 0))(x)
-    # x = Lambda(lambda a: K.reshape(a, list(K.int_shape(x))[2:]))(x)
-    print(K.int_shape(x))
-    # x = keras.layers.Reshape(list(K.int_shape(x))[2:])(x)
-    return [x]
-
-  @classmethod
   def handle_reciprocal(cls, node, input_dict):
     return [Lambda(lambda x: 1.0/x)(input_dict[node.inputs[0]])]
 
   @classmethod
   def handle_reduce_l1(cls, node, input_dict):
     axis = node.attrs.get("axes")
-    if isinstance(axis, list) and len(axis) > 1:
-        raise NotImplementedError('reduce_l1 with axis length>1 is not implemented')
-    keepdims = node.attrs.get("keepdims", 1)
-    if keepdims == 1:
-      keepdims = True
-    else:
-      keepdims = False
+    keepdims = bool(node.attrs.get("keepdims", 1))
+
     tensor = input_dict[node.inputs[0]]
     return [Lambda(lambda x: K.sum(K.abs(x), axis=axis, keepdims=keepdims))(tensor)]
+
+  @classmethod
+  def handle_reduce_log_sum_exp(cls, node, input_dict):
+    return cls._reduce_op(node, input_dict, K.logsumexp)
+
+  @classmethod
+  def handle_reduce_max(cls, node, input_dict):
+    return cls._reduce_op(node, input_dict, K.max)
+
+  @classmethod
+  def handle_reduce_mean(cls, node, input_dict):
+    return cls._reduce_op(node, input_dict, K.mean)
+
+  @classmethod
+  def handle_reduce_min(cls, node, input_dict):
+    return cls._reduce_op(node, input_dict, K.min)
+
+  @classmethod
+  def handle_reduce_prod(cls, node, input_dict):
+    return cls._reduce_op(node, input_dict, K.prod)
+
+  @classmethod
+  def handle_reduce_sum(cls, node, input_dict):
+    return cls._reduce_op(node, input_dict, K.sum)
+
+  @classmethod
+  def handle_reduce_log_sum(cls, node, input_dict):
+    axis = node.attrs.get("axes")
+    keepdims = bool(node.attrs.get("keepdims", 1))
+
+    tensor = input_dict[node.inputs[0]]
+    return [Lambda(lambda x: K.log(K.sum(x, axis=axis, keepdims=keepdims)))(tensor)]
+
+  @classmethod
+  def handle_reduce_sum_square(cls, node, input_dict):
+    axis = node.attrs.get("axes")
+    keepdims = bool(node.attrs.get("keepdims", 1))
+
+    tensor = input_dict[node.inputs[0]]
+    return [Lambda(lambda x: K.sum(K.square(x), axis=axis, keepdims=keepdims))(tensor)]
 
   @classmethod
   def handle_reshape(cls, node, input_dict):
     tensor = input_dict[node.inputs[0]]
     shape =node.attrs["shape"]
-    return [keras.layers.core.Reshape(shape)(tensor)]
+
+    if isinstance(tensor, np.ndarray):
+      return [np.reshape(tensor, shape)]
+    else:
+      return [Lambda(lambda x: K.reshape(x, shape))(tensor)]
 
   @classmethod
   def handle_rnn(cls, node, input_dict):
@@ -865,10 +864,10 @@ class KerasBackend(Backend):
   def handle_softmax(cls, node, input_dict):
     x = input_dict[node.inputs[0]]
     shape = K.int_shape(x)
-    if "axis" in node.attrs \
+    if "axis" in node.attrs.keys() \
             and (node.attrs['axis'] == -1 or node.attrs["axis"] == len(shape) - 1):
         return [Lambda(lambda a: K.softmax(a))(x)]
-    if "axis" in node.attrs:
+    if "axis" in node.attrs.keys():
         axis = node.attrs["axis"]
         axis = (axis if axis >= 0 else
                 len(shape) + axis)
@@ -884,6 +883,26 @@ class KerasBackend(Backend):
     return [x]
 
   @classmethod
+  def handle_space_to_depth(cls, node, input_dict):
+    x = input_dict[node.inputs[0]]
+    block_size = node.attrs['blocksize']
+    b, c, h, w = K.int_shape(x)
+    h_size = int(h/block_size)
+    w_size = int(w/block_size)
+    x = keras.layers.Reshape([c, block_size, h_size, block_size, w_size])(x)
+    x = keras.layers.Permute((1,2,4,3,5))(x)
+    x = keras.layers.Reshape([c * (block_size**2), h_size, w_size])(x)
+    return [x]
+
+  @classmethod
+  def handle_squeeze(cls, node, input_dict):
+    x = input_dict[node.inputs[0]]
+    axis = node.attrs['axes']
+    for i in range(len(axis)):
+      x = Lambda(lambda a: K.squeeze(a, axis[i]-i))(x)
+    return [x]
+
+  @classmethod
   def handle_sub(cls, node, input_dict):
     return [cls._bin_op(node, input_dict, keras.layers.subtract)]
 
@@ -892,11 +911,21 @@ class KerasBackend(Backend):
     values = [input_dict[a] for a in node.inputs]
     return [Lambda(lambda x: K.sum(K.stack(x), axis=0))(values)]
 
-  @classmethod
-  def handle_mat_mul(cls, node, input_dict):
-    return [Lambda(lambda x, y: K.dot(x,y))(input_dict[node.inputs[0]],
-                      input_dict[node.inputs[1]])]
 
+
+  @classmethod
+  def handle_tile(cls, node, input_dict):
+    x = input_dict[node.inputs[0]]
+    repeats = input_dict[node.inputs[1]]
+    return [Lambda(lambda a: K.tile(a, repeats))(x)]
+
+  @classmethod
+  def handle_transpose(cls, node, input_dict):
+    x = input_dict[node.inputs[0]]
+    if 'perm' in node.attrs.keys():
+      return [Lambda(lambda a: K.permute_dimensions(x, node.attrs['perm']))(x)]
+    else:
+      return [Lambda(lambda a: K.transpose(x))]
 
 prepare = KerasBackend.prepare
 
