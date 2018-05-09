@@ -120,9 +120,12 @@ class KerasFrontend(object):
         graph_inputs = []
         for i in model.inputs:
             shape = convert_shape(K.int_shape(i))
+            if shape[0] == -1:
+                shape[0] = 1
             # channels_last to channels_first
             if K.image_data_format() == "channels_last" and len(shape) == 4:
                 shape = shape[:1] + shape[3:] + shape[1:3]
+            print(shape)
             graph_inputs.append(make_tensor_value_info(name=i.name,
                                                        elem_type=STR_TO_ONNX_TYPE[K.dtype(i)],
                                                        shape=shape))
@@ -823,7 +826,10 @@ class KerasFrontend(object):
         config = layer.get_config()
 
         # padding in Keras, is [(begin,end),(begin,end),...,]
-        padding = config["padding"]
+        if K.image_data_format() == "channel_first":
+            padding = ((0,0),(0,0)) + config["padding"]
+        else:
+            padding = ((0, 0)) + config["padding"] +((0, 0))
 
         # onnx attribute
         mode = "constant"

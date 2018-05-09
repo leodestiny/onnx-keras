@@ -212,7 +212,7 @@ class KerasBackend(Backend):
         broadcast = node.attrs.get("broadcast", 1)
         if broadcast == 0:
             warnings.warn("Definition of {} with broadcast disabled is not "
-                          "yet supported.".format(node.type), UserWarning)
+                          "yet supported.".format(node.op_type), UserWarning)
         if "axis" in node.attrs.keys():
             num_ones_to_append = len(x.get_shape()) - \
                                  len(y.get_shape()) - \
@@ -261,7 +261,7 @@ class KerasBackend(Backend):
 
             shape = list(d.dim_value for d in
                          value_info.type.tensor_type.shape.dim)
-            x = Input(shape=shape[1:], dtype=
+            x = Input(batch_shape=shape, dtype=
             cls.tensor_type_enum[value_info.type.tensor_type.elem_type])
 
             input_dict_items.append([value_info.name, x])
@@ -278,9 +278,14 @@ class KerasBackend(Backend):
         # defined tensors so we can have access to the placeholders
         # to feed in input tensors when we run the graph.
         original_input_dict = dict(input_dict_items)
+
+        cnt = 0
         output_dict = dict()
         for node in graph_def.node:
             node = OnnxNode(node)
+
+            cnt += 1
+            print(cnt)
 
             output_ops = cls._onnx_node_to_keras_op(node, input_dict)
             curr_node_output_map = list(zip(node.outputs, output_ops))
@@ -919,6 +924,39 @@ class KerasBackend(Backend):
         else:
             return [Lambda(lambda a: K.transpose(x))]
 
+    @classmethod
+    def _pad(cls, x, pad, dim):
+        import copy
+        for i in range(dim):
+            if pad[i] == 0 and pad[i + dim] == 0:
+                continue
+            shape = K.int_shape(x)
+            zero_shape = copy.deepcopy(list(shape))
+            zero_shape[i] = pad[i]
+            zeros1 = K.zeros(zero_shape)
+            zero_shape[i] = pad[i + dim]
+            zeros2 = K.zeros(zero_shape)
+            x = K.concatenate([zeros1, x, zeros2], axis=i)
+        return x
+
+    @classmethod
+    def handle_pad(cls, node, input_dict):
+        num_dim = int(len(node.attrs["pads"]) / 2)
+        mode = node.attrs.get("mode", "constant")
+        if mode != "constant":
+            warnings.warn("Unsupported mode:{} attribute by Keras in "
+                          "pad operator. The attribute will be ignored.".format(mode),
+                          UserWarning)
+
+        value = node.attrs.get("value", 0)
+        if value != 0:
+            warnings.warn("Unsupported value:{} attribute by Keras in "
+                          "pad operator. The attribute will be ignored.".format(value),
+                          UserWarning)
+        pads = node.attrs["pads"]
+
+        x = input_dict[node.inputs[0]]
+        return [Lambda(lambda a: cls._pad(a, pads, num_dim))(x)]
 
 prepare = KerasBackend.prepare
 
