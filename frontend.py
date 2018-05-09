@@ -1,4 +1,4 @@
-import keras.backend as K
+import numpy as np
 from keras.layers import *
 from onnx.checker import check_model
 from onnx.helper import (make_graph, make_model, make_node, make_tensor, make_tensor_value_info)
@@ -62,9 +62,9 @@ class KerasFrontend(object):
             Flatten: cls.create_flatten,
             Reshape: cls.create_reshape,
             BatchNormalization: cls.create_batch_normalization,
-            LSTM:cls.create_LSTM,
-            SimpleRNN:cls.create_RNN,
-            GRU:cls.create_GRU
+            LSTM: cls.create_LSTM,
+            SimpleRNN: cls.create_RNN,
+            GRU: cls.create_GRU
         }
         activation_to_handler = {
             "softmax": cls.create_softmax,
@@ -91,18 +91,19 @@ class KerasFrontend(object):
     @classmethod
     def keras_model_to_onnx_model(cls, model,
                                   producer_name="onnx-keras",
-                                  model_name="keras-model"):
+                                  model_name="keras-model",
+                                  model_version=1):
 
         # TODO save domain, model_version,doc_string
 
-        model = make_model(cls.keras_graph_to_onnx_graph(model),
-                           model_version=1,
+        model = make_model(cls.keras_graph_to_onnx_graph(model,name=model_name),
+                           model_version=model_version,
                            producer_name=producer_name)
         check_model(model)
         return model
 
     @classmethod
-    def keras_graph_to_onnx_graph(cls, model):
+    def keras_graph_to_onnx_graph(cls, model,name):
 
         # some import attribute:keras_version, backend
 
@@ -117,7 +118,8 @@ class KerasFrontend(object):
         graph_inputs = []
         for i in model.inputs:
             shape = convert_shape(K.int_shape(i))
-            if K.image_data_format() == "channels_last":
+            # channels_last to channels_first
+            if K.image_data_format() == "channels_last" and len(shape) == 4:
                 shape = shape[:1] + shape[3:] + shape[1:3]
             graph_inputs.append(make_tensor_value_info(name=i.name,
                                                        elem_type=STR_TO_ONNX_TYPE[K.dtype(i)],
@@ -130,10 +132,8 @@ class KerasFrontend(object):
         initializer = []
 
         for i, layer in enumerate(model.layers):
-            print(i)
             # the InputLayer only contain input data of model
             if isinstance(layer, InputLayer):
-                # TODO input maybe a channel last?
                 continue
             else:
                 handler = cls.switch_onnx_node_creater(layer)
@@ -144,7 +144,7 @@ class KerasFrontend(object):
                 initializer.extend(weight_list)
 
         return make_graph(nodes=nodes,
-                          name="test",
+                          name=name,
                           inputs=graph_inputs,
                           outputs=graph_outputs,
                           initializer=initializer)
@@ -179,18 +179,52 @@ class KerasFrontend(object):
 
             scale_weight, B_weight, mean_weight, var_weight = weights_values
 
-            graph_input_list.append(cls.make_symbolic_weights(scale_name, scale_weight))
-            graph_input_list.append(cls.make_symbolic_weights(B_name, B_weight))
-            graph_input_list.append(cls.make_symbolic_weights(mean_name, mean_weight))
-            graph_input_list.append(cls.make_symbolic_weights(var_name, var_weight))
+        elif config['center'] and not config['scale']:
+            # the order of weights is : [beta(bias), mean, variance]
+            B_name = symbolic_weights[0].name
+            mean_name = symbolic_weights[1].name
+            var_name = symbolic_weights[2].name
 
-            weight_list.append(cls.make_weights(scale_name, scale_weight))
-            weight_list.append(cls.make_weights(B_name, B_weight))
-            weight_list.append(cls.make_weights(mean_name, mean_weight))
-            weight_list.append(cls.make_weights(var_name, var_weight))
-            inputs.extend([scale_name, B_name, mean_name, var_name])
+            B_weight, mean_weight, var_weight = weights_values
+
+            scale_name = layer.name + "/gamma"
+            scale_weight = np.ones(B_weight.shape, dtype=float)
+
+        elif not config['center'] and config['scale']:
+            # the order of weights is : [gamma(scale), mean, variance]
+            scale_name = symbolic_weights[0].name
+            mean_name = symbolic_weights[1].name
+            var_name = symbolic_weights[2].name
+
+            scale_weight, mean_weight, var_weight = weights_values
+
+            B_name = layer.name + "/beta"
+            B_weight = np.zeros(scale_weight.shape, dtype=float)
+
         else:
-            raise NotImplementedError("ONNX need both center and scale must be True")
+            # the order of weights is : [mean, variance]
+            mean_name = symbolic_weights[0].name
+            var_name = symbolic_weights[1].name
+
+            mean_weight, var_weight = weights_values
+
+            scale_name = layer.name + "/gamma"
+            scale_weight = np.ones(mean_weight.shape, dtype=float)
+
+            B_name = layer.name + "/beta"
+            B_weight = np.zeros(mean_weight.shape, dtype=float)
+
+        graph_input_list.append(cls.make_symbolic_weights(scale_name, scale_weight))
+        graph_input_list.append(cls.make_symbolic_weights(B_name, B_weight))
+        graph_input_list.append(cls.make_symbolic_weights(mean_name, mean_weight))
+        graph_input_list.append(cls.make_symbolic_weights(var_name, var_weight))
+
+        weight_list.append(cls.make_weights(scale_name, scale_weight))
+        weight_list.append(cls.make_weights(B_name, B_weight))
+        weight_list.append(cls.make_weights(mean_name, mean_weight))
+        weight_list.append(cls.make_weights(var_name, var_weight))
+        inputs.extend([scale_name, B_name, mean_name, var_name])
+        consumed_inputs = [0, 0, 0, 1, 1]
 
         # onnx outpus
         # notate onnx has other opitional output, but there is only one output in keras
@@ -203,7 +237,7 @@ class KerasFrontend(object):
                          name=layer.name,
                          epsilon=epsilon,
                          momentum=momentum,
-                         consumed_inputs=[0, 0, 0, 1, 1],
+                         consumed_inputs=consumed_inputs,
                          spatial=spatial)
         node_list.append(node)
 
@@ -249,13 +283,17 @@ class KerasFrontend(object):
 
         W_name = symbolic_weights[0].name
         W_weight = weights_values[0]
-        W_weight = np.concatenate((W_weight[:,:hidden_size],W_weight[:,3*hidden_size:],W_weight[:,hidden_size:3*hidden_size]),axis=1)
+        W_weight = np.concatenate(
+            (W_weight[:, :hidden_size], W_weight[:, 3 * hidden_size:], W_weight[:, hidden_size:3 * hidden_size]),
+            axis=1)
         graph_input_list.append(cls.make_symbolic_weights(W_name, W_weight))
         weight_list.append(cls.make_weights(W_name, W_weight))
 
         R_name = symbolic_weights[1].name
-        R_weight = weights_values[0]
-        R_weight = np.concatenate((R_weight[:,:hidden_size],R_weight[:,3*hidden_size:],R_weight[:,hidden_size:3*hidden_size]),axis=1)
+        R_weight = weights_values[1]
+        R_weight = np.concatenate(
+            (R_weight[:, :hidden_size], R_weight[:, 3 * hidden_size:], R_weight[:, hidden_size:3 * hidden_size]),
+            axis=1)
         graph_input_list.append(cls.make_symbolic_weights(R_name, R_weight))
         weight_list.append(cls.make_weights(R_name, R_weight))
 
@@ -265,11 +303,14 @@ class KerasFrontend(object):
         if config['use_bias']:
             B_name = symbolic_weights[2].name
             B_weight = weights_values[2]
-            B_weight = np.concatenate((B_weight[:hidden_size],B_weight[3*hidden_size:],B_weight[hidden_size:3*hidden_size]),axis=0)
+            B_weight = np.concatenate(
+                (B_weight[:hidden_size], B_weight[3 * hidden_size:], B_weight[hidden_size:3 * hidden_size]), axis=0)
             graph_input_list.append(cls.make_symbolic_weights(B_name, B_weight))
             weight_list.append(cls.make_weights(B_name, B_weight))
 
             inputs.append(B_name)
+        else:
+            inputs.append("")
 
         # these inputs are not used
         sequence_lens = None
@@ -280,11 +321,17 @@ class KerasFrontend(object):
         # onnx output
         # Y represent all intermediate value
         # Y should used when return_sequences is true
-        # T_h represent last output value of hidden
+        # Y_h represent last output value of hidden
         # set by return_sequence
 
-        Y = layer.output.name
-        outputs = [Y]
+        Y = ""
+        Y_h = ""
+
+        if output_sequence == 1:
+            Y = layer.output.name
+        else:
+            Y_h = layer.output.name
+        outputs = [Y, Y_h]
 
         node_list.append(make_node("LSTM",
                                    inputs=inputs,
@@ -310,12 +357,12 @@ class KerasFrontend(object):
         # onnx attribute
 
         # no alpha and beta in Keras activation function
-        activation_alpha = [0.0, 0.0, 0.0]
-        activation_beta = [0.0, 0.0, 0.0]
+        activation_alpha = [0.0, 0.0]
+        activation_beta = [0.0, 0.0]
 
-        # the activation function order is f, g, h in onnx
-        # coresponding is recurrent_activation, activation, activation in keras
-        activations = [config['recurrent_activation'], config['activation'], config['activation']]
+        # the activation function order is f, g in onnx
+        # coresponding is recurrent_activation, activation in keras
+        activations = [config['recurrent_activation'], config['activation']]
 
         # no clip in Keras
         clip = None
@@ -332,24 +379,17 @@ class KerasFrontend(object):
             output_sequence = 1
 
         # onnx input
-        # however W,R,B matrix order is [i f c o] in keras
-        # the W,R,B matrix order is [i o f c] in onnx
+        # onnx and keras has same order : zrh
         symbolic_weights = layer.weights
         weights_values = K.batch_get_value(symbolic_weights)
 
         W_name = symbolic_weights[0].name
         W_weight = weights_values[0]
-        W_weight = np.concatenate(
-            (W_weight[:, :hidden_size], W_weight[:, 3 * hidden_size:], W_weight[:, hidden_size:3 * hidden_size]),
-            axis=1)
         graph_input_list.append(cls.make_symbolic_weights(W_name, W_weight))
         weight_list.append(cls.make_weights(W_name, W_weight))
 
         R_name = symbolic_weights[1].name
-        R_weight = weights_values[0]
-        R_weight = np.concatenate(
-            (R_weight[:, :hidden_size], R_weight[:, 3 * hidden_size:], R_weight[:, hidden_size:3 * hidden_size]),
-            axis=1)
+        R_weight = weights_values[1]
         graph_input_list.append(cls.make_symbolic_weights(R_name, R_weight))
         weight_list.append(cls.make_weights(R_name, R_weight))
 
@@ -359,27 +399,30 @@ class KerasFrontend(object):
         if config['use_bias']:
             B_name = symbolic_weights[2].name
             B_weight = weights_values[2]
-            B_weight = np.concatenate(
-                (B_weight[:hidden_size], B_weight[3 * hidden_size:], B_weight[hidden_size:3 * hidden_size]), axis=0)
             graph_input_list.append(cls.make_symbolic_weights(B_name, B_weight))
             weight_list.append(cls.make_weights(B_name, B_weight))
 
             inputs.append(B_name)
+        else:
+            inputs.append("")
 
         # these inputs are not used
         sequence_lens = None
-        initial_h = None
-        inital_c = None
-        P = None
 
         # onnx output
         # Y represent all intermediate value
         # Y should used when return_sequences is true
-        # T_h represent last output value of hidden
+        # Y_h represent last output value of hidden
         # set by return_sequence
 
-        Y = layer.output.name
-        outputs = [Y]
+        Y = ""
+        Y_h = ""
+
+        if output_sequence == 1:
+            Y = layer.output.name
+        else:
+            Y_h = layer.output.name
+        outputs = [Y, Y_h]
 
         node_list.append(make_node("GRU",
                                    inputs=inputs,
@@ -405,12 +448,10 @@ class KerasFrontend(object):
         # onnx attribute
 
         # no alpha and beta in Keras activation function
-        activation_alpha = [0.0, 0.0, 0.0]
-        activation_beta = [0.0, 0.0, 0.0]
+        activation_alpha = [0.0]
+        activation_beta = [0.0]
 
-        # the activation function order is f, g, h in onnx
-        # coresponding is recurrent_activation, activation, activation in keras
-        activations = [config['activation'], config['activation'], config['activation']]
+        activations = [config['activation']]
 
         # no clip in Keras
         clip = None
@@ -427,24 +468,16 @@ class KerasFrontend(object):
             output_sequence = 1
 
         # onnx input
-        # however W,R,B matrix order is [i f c o] in keras
-        # the W,R,B matrix order is [i o f c] in onnx
         symbolic_weights = layer.weights
         weights_values = K.batch_get_value(symbolic_weights)
 
         W_name = symbolic_weights[0].name
         W_weight = weights_values[0]
-        W_weight = np.concatenate(
-            (W_weight[:, :hidden_size], W_weight[:, 3 * hidden_size:], W_weight[:, hidden_size:3 * hidden_size]),
-            axis=1)
         graph_input_list.append(cls.make_symbolic_weights(W_name, W_weight))
         weight_list.append(cls.make_weights(W_name, W_weight))
 
         R_name = symbolic_weights[1].name
-        R_weight = weights_values[0]
-        R_weight = np.concatenate(
-            (R_weight[:, :hidden_size], R_weight[:, 3 * hidden_size:], R_weight[:, hidden_size:3 * hidden_size]),
-            axis=1)
+        R_weight = weights_values[1]
         graph_input_list.append(cls.make_symbolic_weights(R_name, R_weight))
         weight_list.append(cls.make_weights(R_name, R_weight))
 
@@ -460,21 +493,26 @@ class KerasFrontend(object):
             weight_list.append(cls.make_weights(B_name, B_weight))
 
             inputs.append(B_name)
+        else:
+            inputs.append("")
 
         # these inputs are not used
         sequence_lens = None
-        initial_h = None
-        inital_c = None
-        P = None
 
         # onnx output
         # Y represent all intermediate value
         # Y should used when return_sequences is true
-        # T_h represent last output value of hidden
+        # Y_h represent last output value of hidden
         # set by return_sequence
 
-        Y = layer.output.name
-        outputs = [Y]
+        Y = ""
+        Y_h = ""
+
+        if output_sequence == 1:
+            Y = layer.output.name
+        else:
+            Y_h = layer.output.name
+        outputs = [Y, Y_h]
 
         node_list.append(make_node("RNN",
                                    inputs=inputs,
@@ -501,6 +539,12 @@ class KerasFrontend(object):
         # onnx attribute
         # using default value
 
+        alpha = 1.0
+        beta = 1.0
+        broadcast = 0
+        transA = 0
+        transB = 0
+
         symbolic_weights = layer.weights
         weights_values = K.batch_get_value(symbolic_weights)
 
@@ -524,19 +568,27 @@ class KerasFrontend(object):
         outputs = [Y_name]
 
         if config['activation'] == "linear":
-            node = make_node("FC",
+            node = make_node("Gemm",
                              inputs=inputs,
                              outputs=outputs,
                              name=layer.name,
-                             axis=1,
-                             axis_w=1)
+                             alpha=alpha,
+                             beta=beta,
+                             broadcast=broadcast,
+                             transA=transA,
+                             transB=transB)
             node_list.append(node)
         else:
             dense_output_name = layer.name + "_output"
-            node = make_node("FC",
+            node = make_node("Gemm",
                              inputs=inputs,
                              outputs=[dense_output_name],
-                             name=layer.name)
+                             name=layer.name,
+                             alpha=alpha,
+                             beta=beta,
+                             broadcast=broadcast,
+                             transA=transA,
+                             transB=transB)
             extra_node = cls.create_extra_activation(layer, dense_output_name)
             node_list.extend([node, extra_node])
 
@@ -592,6 +644,8 @@ class KerasFrontend(object):
                                            dims=bias_weight.shape,
                                            vals=bias_weight.flatten().tolist()))
             inputs.append(bias_name)
+        else:
+            inputs.append("")
 
         # get onnx attribute from keras config
         strides = list(config['strides'])
@@ -667,6 +721,8 @@ class KerasFrontend(object):
             graph_input_list.append(cls.make_symbolic_weights(bias_name, bias_weight))
             weight_list.append(cls.make_weights(bias_name, bias_weight))
             inputs.append(bias_name)
+        else:
+            inputs.append("")
 
         # get onnx attribute from keras config
         strides = list(config['strides'])
@@ -681,7 +737,7 @@ class KerasFrontend(object):
 
         if config['activation'] == 'linear':
             node = make_node(
-                "Conv",
+                "ConvTranspose",
                 inputs=inputs,
                 outputs=outputs,
                 name=layer.name,
@@ -997,7 +1053,7 @@ class KerasFrontend(object):
                          outputs=[layer.output.name],
                          name=layer.name,
                          ratio=config['rate'],
-                         is_test =1)
+                         is_test=1)
         node_list.append(node)
         return graph_input_list, weight_list, node_list
 
