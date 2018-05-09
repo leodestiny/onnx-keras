@@ -134,7 +134,6 @@ class KerasBackend(Backend):
 
   onnx_keras_op_map = {
       "abs": K.abs,
-      "cast": K.cast,
       "exp": K.exp,
       "hardsigmoid": K.hard_sigmoid,
       "log": K.log,
@@ -148,21 +147,6 @@ class KerasBackend(Backend):
       "sqrt": K.sqrt,
       "tanh": K.tanh,
   }
-
-  # tensor_type_to_keras_type = {
-  #     TensorProto.FLOAT: 'float32',
-  #     TensorProto.UINT8: 'uint8',
-  #     TensorProto.INT8: 'int8',
-  #     TensorProto.UINT16: 'uint16',
-  #     TensorProto.INT16: 'int16',
-  #     TensorProto.INT32: 'int32',
-  #     TensorProto.INT64: 'int64',
-  #     TensorProto.BOOL: 'bool',
-  #     TensorProto.FLOAT16: 'float16',
-  #     TensorProto.DOUBLE: 'float64',
-  #     TensorProto.COMPLEX64: 'complex64',
-  #     TensorProto.COMPLEX128: 'complex128',
-  # }
 
   tensor_type_enum = [
       "undefined",
@@ -221,8 +205,9 @@ class KerasBackend(Backend):
   def _bin_op(cls, node, input_dict, op_func, inputlist=True):
     x = input_dict[node.inputs[0]]
     y = input_dict[node.inputs[1]]
-
+    # print(node.op_type, x.shape, y.shape)
     if isinstance(y, np.ndarray):
+        # print('is numpy')
         # tmp = np.reshape(y, [1]+list(y.shape))
         tmp = np.tile(y,[32]+[1]*len(y.shape))
         cls.extra_input_array.append(tmp)
@@ -431,15 +416,6 @@ class KerasBackend(Backend):
 
   @classmethod
   def handle_add(cls, node, input_dict):
-    x = input_dict[node.inputs[0]]
-    y = input_dict[node.inputs[1]]
-    # tmp = np.array([0])
-    #
-    # if type(y) == type(tmp):
-    #   total_num_dim = len(x.get_shape())
-    #   y = cls._explicit_broadcast(y,0,total_num_dim-1)
-    #   return [Lambda(lambda a: K.bias_add(a, K.constant(y)))(x)]
-
     return [cls._bin_op(node, input_dict, keras.layers.add)]
 
   @classmethod
@@ -538,7 +514,6 @@ class KerasBackend(Backend):
   def handle_concat(cls, node, input_dict):
     values = [input_dict[a] for a in node.inputs]
     axis = node.attrs.get("axis", 1)
-
     return [keras.layers.concatenate(values, axis=axis)]
 
   @classmethod
@@ -558,9 +533,7 @@ class KerasBackend(Backend):
     dilations = node.attrs.get("dilations", [1]*dim)
     strides = node.attrs.get("strides", [1]*dim)
     kernel_size = node.attrs.get("kernel_shape")
-    if "group" in node.attrs.keys() and node.attrs['group'] != 1:
-      raise NotImplementedError("'group' attribute in conv is not implemented")
-
+    group = node.attrs.get('group', 1)
     padding='valid'
 
     if "auto_pad" in node.attrs.keys():
@@ -571,14 +544,14 @@ class KerasBackend(Backend):
 
     if "pads" in node.attrs.keys():
       x = cls.get_keras_pad(x, node.attrs["pads"], dim, data_format)
-
+    from custom_layers import GroupConv
     if len(node.inputs) == 2:
-      convolved = keras.layers.convolutional._Conv(
+      convolved = GroupConv(group=group,
         rank=dim, filters=filters, kernel_size=kernel_size, data_format=data_format, padding=padding,
         dilation_rate=dilations, strides=strides, use_bias=False, weights=[W_weights])(x)
     else:
       bias = input_dict[node.inputs[2]]
-      convolved = keras.layers.convolutional._Conv(
+      convolved = GroupConv(group=group,
         rank=dim, filters=filters, kernel_size=kernel_size, data_format=data_format, padding=padding,
         dilation_rate=dilations, strides=strides, use_bias=True, weights=[W_weights, bias])(x)
 
@@ -645,17 +618,6 @@ class KerasBackend(Backend):
         split1 = np.prod(split1)
         output_shape = np.stack([split0, split1])
     return [keras.layers.core.Reshape(output_shape)(tensor)]
-
-  @classmethod
-  def handle_gather(cls, node, input_dict):
-      x = input_dict[node.inputs[0]]
-
-      y = input_dict[node.inputs[1]]
-      axis = node.attrs.get(['axis'], 0)
-      if axis != 0:
-          raise NotImplementedError
-      return [Lambda(lambda _x, _y: K.gather(_x, _y))(x, y)]
-
 
   @classmethod
   def handle_gemm(cls, node, input_dict):
@@ -726,6 +688,16 @@ class KerasBackend(Backend):
     return [Lambda(lambda a: K.relu(a)-alpha*K.relu(-a))(x)]
 
   @classmethod
+  def handle_l_r_n(cls, node, input_dict):
+    from custom_layers import LRN
+    x = input_dict[node.inputs[0]]
+    alpha = node.attrs["alpha"]
+    beta = node.attrs["beta"]
+    bias = node.attrs["bias"]
+    size = node.attrs["size"]
+    return [LRN(alpha=alpha, beta=beta, k=bias, n=size)(x)]
+
+  @classmethod
   def handle_mat_mul(cls, node, input_dict):
     return [Lambda(lambda x: K.dot(x[0], x[1]))([input_dict[node.inputs[0]],
                                                input_dict[node.inputs[1]]])]
@@ -769,36 +741,6 @@ class KerasBackend(Backend):
     slope = cls._explicit_broadcast(slope, 1, len(x.get_shape()))
     return [keras.layers.advanced_activations.PReLU(alpha=slope)]
 
-
-  @classmethod
-  def handle_pad(cls, node, input_dict):
-    num_dim = int(len(node.attrs["pads"])/2)
-    mode = node.attrs.get("mode", "constant")
-    if mode != "constant":
-        warnings.warn("Unsupported mode:{} attribute by Keras in "
-                      "pad operator. The attribute will be ignored.".format(mode),
-                      UserWarning)
-
-    value = node.attrs.get("value", 0)
-    if value != 0:
-        warnings.warn("Unsupported value:{} attribute by Keras in "
-                      "pad operator. The attribute will be ignored.".format(value),
-                      UserWarning)
-
-    pads = node.attrs["pads"]
-
-    x = input_dict[node.inputs[0]]
-    print(K.int_shape(x))
-    x = Lambda(lambda a: K.expand_dims(K.expand_dims(a, 0), 0))(x)
-    # x = Lambda(lambda a: K.reshape(a, [1,1]+list(K.int_shape(x))))(x)
-    print(K.int_shape(x))
-    x = cls.get_keras_pad(x, pads, num_dim, 'channels_first')
-    print(K.int_shape(x))
-    x = Lambda(lambda a: K.squeeze(K.squeeze(a, 0), 0))(x)
-    # x = Lambda(lambda a: K.reshape(a, list(K.int_shape(x))[2:]))(x)
-    print(K.int_shape(x))
-    # x = keras.layers.Reshape(list(K.int_shape(x))[2:])(x)
-    return [x]
 
   @classmethod
   def handle_reciprocal(cls, node, input_dict):
