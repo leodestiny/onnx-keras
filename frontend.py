@@ -826,7 +826,7 @@ class KerasFrontend(object):
         config = layer.get_config()
 
         # padding in Keras, is [(begin,end),(begin,end),...,]
-        if K.image_data_format() == "channel_first":
+        if K.image_data_format() == "channels_first":
             padding = ((0,0),(0,0)) + config["padding"]
         else:
             padding = ((0, 0)) + config["padding"] +((0, 0))
