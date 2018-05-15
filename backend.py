@@ -316,9 +316,7 @@ class KerasBackend(Backend):
         res_model = Model(inputs=inputs + cls.extra_input,
                           outputs=outputs)
 
-        print(res_model.layers)
         return res_model
-        # return TensorflowRep(predict_net, original_input_dict, uninitialized)
 
     @classmethod
     def onnx_initializer_to_input_dict_items(cls,
@@ -958,6 +956,10 @@ class KerasBackend(Backend):
         x = input_dict[node.inputs[0]]
         return [Lambda(lambda a: cls._pad(a, pads, num_dim))(x)]
 
+    @classmethod
+    def load(cls,filepath):
+        return onnx.load(filepath)
+
 prepare = KerasBackend.prepare
 
 run_node = KerasBackend.run_node
@@ -965,3 +967,5 @@ run_node = KerasBackend.run_node
 run_model = KerasBackend.run_model
 
 supports_device = KerasBackend.supports_device
+
+load = KerasBackend.load

@@ -1327,5 +1327,11 @@ class KerasFrontend(object):
         node_list.append(node)
         return graph_input_list, weight_list, node_list
 
+    @classmethod
+    def save(cls,onnx_model,filepath):
+        with open(filepath,"wb") as f:
+            f.write(onnx_model.SerializeToString())
+
 
 keras_model_to_onnx_model = KerasFrontend.keras_model_to_onnx_model
+save = KerasFrontend.save
