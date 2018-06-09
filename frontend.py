@@ -826,15 +826,16 @@ class KerasFrontend(object):
         config = layer.get_config()
 
         # padding in Keras, is [(begin,end),(begin,end),...,]
+        padding = np.asarray(config['padding'])
         if K.image_data_format() == "channels_first":
-            padding = ((0,0),(0,0)) + config["padding"]
+            padding = np.zeros((2,2)) + padding
         else:
-            padding = ((0, 0)) + config["padding"] +((0, 0))
+            padding = np.concatenate((np.zeros((1,2)),padding,np.zeros((1,2))),axis=0)
 
         # onnx attribute
         mode = "constant"
         # however, pads, in onnx ,is like [begin0, begin1, begin2, ... ,end0, end1]
-        pads = np.asarray(padding).transpose().flatten().tolist()
+        pads = padding.astype(dtype=int).transpose().flatten().tolist()
         value = 0.0
 
         # onnx input
@@ -1328,8 +1329,8 @@ class KerasFrontend(object):
         return graph_input_list, weight_list, node_list
 
     @classmethod
-    def save(cls,onnx_model,filepath):
-        with open(filepath,"wb") as f:
+    def save(cls, onnx_model, filepath):
+        with open(filepath, "wb") as f:
             f.write(onnx_model.SerializeToString())
 
 
